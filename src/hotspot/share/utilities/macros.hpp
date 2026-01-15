@@ -161,6 +161,24 @@
 #define NOT_EPSILONGC_RETURN_(code) { return code; }
 #endif // INCLUDE_EPSILONGC
 
+#ifndef INCLUDE_ORACLEGC
+#define INCLUDE_ORACLEGC 1
+#endif // INCLUDE_ORACLEGC
+
+#if INCLUDE_ORACLEGC
+#define ORACLEGC_ONLY(x) x
+#define ORACLEGC_ONLY_ARG(arg) arg,
+#define NOT_ORACLEGC(x)
+#define NOT_ORACLEGC_RETURN        /* next token must be ; */
+#define NOT_ORACLEGC_RETURN_(code) /* next token must be ; */
+#else
+#define ORACLEGC_ONLY(x)
+#define ORACLEGC_ONLY_ARG(arg)
+#define NOT_ORACLEGC(x) x
+#define NOT_ORACLEGC_RETURN        {}
+#define NOT_ORACLEGC_RETURN_(code) { return code; }
+#endif // INCLUDE_ORACLEGC
+
 #ifndef INCLUDE_G1GC
 #define INCLUDE_G1GC 1
 #endif // INCLUDE_G1GC

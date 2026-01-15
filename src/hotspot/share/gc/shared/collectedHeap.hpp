@@ -190,6 +190,7 @@ protected:
     Parallel,
     G1,
     Epsilon,
+    Oracle,
     Z,
     Shenandoah
   };

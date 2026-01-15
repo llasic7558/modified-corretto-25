@@ -33,6 +33,9 @@
 #if INCLUDE_G1GC
 #include "gc/g1/g1Arguments.hpp"
 #endif
+#if INCLUDE_ORACLEGC
+#include "gc/oracle/oracleArguments.hpp"
+#endif
 #if INCLUDE_PARALLELGC
 #include "gc/parallel/parallelArguments.hpp"
 #endif
@@ -58,6 +61,7 @@ struct IncludedGC {
 
    EPSILONGC_ONLY(static EpsilonArguments    epsilonArguments;)
         G1GC_ONLY(static G1Arguments         g1Arguments;)
+    ORACLEGC_ONLY(static OracleArguments     oracleArguments;)
   PARALLELGC_ONLY(static ParallelArguments   parallelArguments;)
     SERIALGC_ONLY(static SerialArguments     serialArguments;)
 SHENANDOAHGC_ONLY(static ShenandoahArguments shenandoahArguments;)
@@ -68,6 +72,7 @@ SHENANDOAHGC_ONLY(static ShenandoahArguments shenandoahArguments;)
 static const IncludedGC IncludedGCs[] = {
    EPSILONGC_ONLY_ARG(IncludedGC(UseEpsilonGC,       CollectedHeap::Epsilon,    epsilonArguments,    "epsilon gc"))
         G1GC_ONLY_ARG(IncludedGC(UseG1GC,            CollectedHeap::G1,         g1Arguments,         "g1 gc"))
+    ORACLEGC_ONLY_ARG(IncludedGC(UseOracleGC,        CollectedHeap::Oracle,     oracleArguments,     "oracle gc"))
   PARALLELGC_ONLY_ARG(IncludedGC(UseParallelGC,      CollectedHeap::Parallel,   parallelArguments,   "parallel gc"))
     SERIALGC_ONLY_ARG(IncludedGC(UseSerialGC,        CollectedHeap::Serial,     serialArguments,     "serial gc"))
 SHENANDOAHGC_ONLY_ARG(IncludedGC(UseShenandoahGC,    CollectedHeap::Shenandoah, shenandoahArguments, "shenandoah gc"))
@@ -88,6 +93,7 @@ bool GCConfig::_gc_selected_ergonomically = false;
 void GCConfig::fail_if_non_included_gc_is_selected() {
   NOT_EPSILONGC(   FAIL_IF_SELECTED(UseEpsilonGC));
   NOT_G1GC(        FAIL_IF_SELECTED(UseG1GC));
+  NOT_ORACLEGC(    FAIL_IF_SELECTED(UseOracleGC));
   NOT_PARALLELGC(  FAIL_IF_SELECTED(UseParallelGC));
   NOT_SERIALGC(    FAIL_IF_SELECTED(UseSerialGC));
   NOT_SHENANDOAHGC(FAIL_IF_SELECTED(UseShenandoahGC));

@@ -153,6 +153,11 @@ ifneq ($(call check-jvm-feature, epsilongc), true)
   JVM_EXCLUDE_PATTERNS += gc/epsilon
 endif
 
+ifneq ($(call check-jvm-feature, oraclegc), true)
+  JVM_CFLAGS_FEATURES += -DINCLUDE_ORACLEGC=0
+  JVM_EXCLUDE_PATTERNS += gc/oracle
+endif
+
 ifneq ($(call check-jvm-feature, zgc), true)
   JVM_CFLAGS_FEATURES += -DINCLUDE_ZGC=0
   JVM_EXCLUDE_PATTERNS += gc/z

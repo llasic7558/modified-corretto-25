@@ -45,7 +45,7 @@ m4_define(jvm_features_valid, m4_normalize( \
     ifdef([custom_jvm_features_valid], custom_jvm_features_valid) \
     \
     cds compiler1 compiler2 dtrace epsilongc g1gc jfr jni-check \
-    jvmci jvmti link-time-opt management minimal opt-size parallelgc \
+    jvmci jvmti link-time-opt management minimal opt-size oraclegc parallelgc \
     serialgc services shenandoahgc vm-structs zero zgc \
 ))
 
@@ -68,6 +68,7 @@ m4_define(jvm_feature_desc_link_time_opt, [enable link time optimization])
 m4_define(jvm_feature_desc_management, [enable java.lang.management API support])
 m4_define(jvm_feature_desc_minimal, [support building variant 'minimal'])
 m4_define(jvm_feature_desc_opt_size, [optimize the JVM library for size])
+m4_define(jvm_feature_desc_oraclegc, [include the oracle (malloc/free) garbage collector for GC study])
 m4_define(jvm_feature_desc_parallelgc, [include the parallel garbage collector])
 m4_define(jvm_feature_desc_serialgc, [include the serial garbage collector])
 m4_define(jvm_feature_desc_services, [enable diagnostic services and client attaching])

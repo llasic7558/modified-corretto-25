@@ -33,6 +33,9 @@
 #if INCLUDE_G1GC
 #include "gc/g1/g1_globals.hpp"
 #endif
+#if INCLUDE_ORACLEGC
+#include "gc/oracle/oracle_globals.hpp"
+#endif
 #if INCLUDE_PARALLELGC
 #include "gc/parallel/parallel_globals.hpp"
 #endif
@@ -62,6 +65,14 @@
     constraint))                                                            \
                                                                             \
   G1GC_ONLY(GC_G1_FLAGS(                                                    \
+    develop,                                                                \
+    develop_pd,                                                             \
+    product,                                                                \
+    product_pd,                                                             \
+    range,                                                                  \
+    constraint))                                                            \
+                                                                            \
+  ORACLEGC_ONLY(GC_ORACLE_FLAGS(                                            \
     develop,                                                                \
     develop_pd,                                                             \
     product,                                                                \
@@ -114,6 +125,9 @@
                                                                             \
   product(bool, UseEpsilonGC, false, EXPERIMENTAL,                          \
           "Use the Epsilon (no-op) garbage collector")                      \
+                                                                            \
+  product(bool, UseOracleGC, false, EXPERIMENTAL,                           \
+          "Use the Oracle (malloc/free) garbage collector for GC study")    \
                                                                             \
   product(bool, UseZGC, false,                                              \
           "Use the Z garbage collector")                                    \
