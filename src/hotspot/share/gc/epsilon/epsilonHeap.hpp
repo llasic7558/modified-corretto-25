@@ -28,6 +28,7 @@
 
 #include "gc/epsilon/epsilonBarrierSet.hpp"
 #include "gc/epsilon/epsilonMonitoringSupport.hpp"
+#include "gc/epsilon/epsilonOracle.hpp"
 #include "gc/shared/collectedHeap.hpp"
 #include "gc/shared/softRefPolicy.hpp"
 #include "gc/shared/space.hpp"
@@ -49,12 +50,21 @@ private:
   volatile size_t _last_counter_update;
   volatile size_t _last_heap_print;
 
+  // Oracle mode support
+  EpsilonOracle* _oracle;
+  volatile size_t _oracle_allocated_bytes;
+
+  // Oracle allocation path (when EpsilonOracleMode is enabled)
+  HeapWord* allocate_work_oracle(size_t size, bool verbose);
+
 public:
   static EpsilonHeap* heap();
 
   EpsilonHeap() :
           _memory_manager("Epsilon Heap"),
-          _space(nullptr) {};
+          _space(nullptr),
+          _oracle(nullptr),
+          _oracle_allocated_bytes(0) {};
 
   Name kind() const override {
     return CollectedHeap::Epsilon;
@@ -135,6 +145,11 @@ private:
   void print_heap_info(size_t used) const;
   void print_metaspace_info() const;
 
+public:
+  // Oracle mode accessors
+  bool is_oracle_mode() const { return _oracle != nullptr; }
+  EpsilonOracle* oracle() const { return _oracle; }
+  size_t oracle_allocated_bytes() const { return _oracle_allocated_bytes; }
 };
 
 #endif // SHARE_GC_EPSILON_EPSILONHEAP_HPP

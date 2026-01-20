@@ -29,14 +29,18 @@
 #include "runtime/javaThread.hpp"
 #include "utilities/debug.hpp"
 
+class Klass;  // Forward declaration
+
 class EpsilonThreadLocalData {
 private:
   size_t _ergo_tlab_size;
   int64_t _last_tlab_time;
+  Klass* _current_alloc_klass;  // For oracle mode: Klass being allocated
 
   EpsilonThreadLocalData() :
           _ergo_tlab_size(0),
-          _last_tlab_time(0) {}
+          _last_tlab_time(0),
+          _current_alloc_klass(nullptr) {}
 
   static EpsilonThreadLocalData* data(Thread* thread) {
     assert(UseEpsilonGC, "Sanity");
@@ -66,6 +70,15 @@ public:
 
   static void set_last_tlab_time(Thread *thread, int64_t time) {
     data(thread)->_last_tlab_time = time;
+  }
+
+  // Oracle mode: current allocation Klass tracking
+  static Klass* current_alloc_klass(Thread* thread) {
+    return data(thread)->_current_alloc_klass;
+  }
+
+  static void set_current_alloc_klass(Thread* thread, Klass* klass) {
+    data(thread)->_current_alloc_klass = klass;
   }
 };
 

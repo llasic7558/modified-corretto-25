@@ -41,6 +41,8 @@
 #include "utilities/align.hpp"
 #include "utilities/copy.hpp"
 #include "utilities/globalDefinitions.hpp"
+#include "gc/epsilon/epsilonThreadLocalData.hpp"
+#include "gc/epsilon/epsilon_globals.hpp"
 
 class MemAllocator::Allocation: StackObj {
   friend class MemAllocator;
@@ -238,7 +240,19 @@ void MemAllocator::Allocation::notify_allocation() {
 
 HeapWord* MemAllocator::mem_allocate_outside_tlab(Allocation& allocation) const {
   allocation._allocated_outside_tlab = true;
+
+  // For EpsilonGC oracle mode: store the Klass being allocated so oracle can filter by type
+  if (UseEpsilonGC && EpsilonOracleMode) {
+    EpsilonThreadLocalData::set_current_alloc_klass(_thread, _klass);
+  }
+
   HeapWord* mem = Universe::heap()->mem_allocate(_word_size, &allocation._overhead_limit_exceeded);
+
+  // Clear the Klass after allocation
+  if (UseEpsilonGC && EpsilonOracleMode) {
+    EpsilonThreadLocalData::set_current_alloc_klass(_thread, nullptr);
+  }
+
   if (mem == nullptr) {
     return mem;
   }
@@ -300,7 +314,18 @@ HeapWord* MemAllocator::mem_allocate_inside_tlab_slow(Allocation& allocation) co
   // Allocate a new TLAB requesting new_tlab_size. Any size
   // between minimal and new_tlab_size is accepted.
   size_t min_tlab_size = ThreadLocalAllocBuffer::compute_min_size(_word_size);
+
+  // For EpsilonGC oracle mode: store the Klass being allocated
+  if (UseEpsilonGC && EpsilonOracleMode) {
+    EpsilonThreadLocalData::set_current_alloc_klass(_thread, _klass);
+  }
+
   mem = Universe::heap()->allocate_new_tlab(min_tlab_size, new_tlab_size, &allocation._allocated_tlab_size);
+
+  // Clear the Klass after allocation
+  if (UseEpsilonGC && EpsilonOracleMode) {
+    EpsilonThreadLocalData::set_current_alloc_klass(_thread, nullptr);
+  }
   if (mem == nullptr) {
     assert(allocation._allocated_tlab_size == 0,
            "Allocation failed, but actual size was updated. min: %zu"

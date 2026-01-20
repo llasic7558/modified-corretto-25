@@ -85,7 +85,24 @@
   product(size_t, EpsilonMinHeapExpand, 128 * M, EXPERIMENTAL,              \
           "Min expansion step for heap. Larger value improves performance " \
           "at the potential expense of memory waste.")                      \
-          range(1, max_intx)
+          range(1, max_intx)                                                \
+                                                                            \
+  product(bool, EpsilonOracleMode, false, EXPERIMENTAL,                     \
+          "Enable oracle-based explicit memory management. "                \
+          "Replaces GC with malloc/free based on pre-computed trace.")      \
+                                                                            \
+  product(ccstr, EpsilonOracleTracePath, nullptr, EXPERIMENTAL,             \
+          "Path to oracle trace file (CSV format: "                         \
+          "alloc_seq,free_at_seq,size,type,obj_id)")                        \
+                                                                            \
+  product(bool, EpsilonOracleValidate, false, EXPERIMENTAL,                 \
+          "Validate allocation sizes against oracle trace (slower)")        \
+                                                                            \
+  product(uint64_t, EpsilonOracleSkipAllocs, 0, EXPERIMENTAL,               \
+          "Number of allocations to skip before starting oracle tracking. " \
+          "Use this to skip VM bootstrap allocations when the trace only "  \
+          "contains application-level allocations.")                        \
+          range(0, max_julong)
 
 // end of GC_EPSILON_FLAGS
 

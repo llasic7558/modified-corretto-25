@@ -29,6 +29,9 @@
 #include "logging/log.hpp"
 #include "runtime/globals.hpp"
 #include "runtime/globals_extension.hpp"
+#include "runtime/java.hpp"
+
+#include <cstring>
 
 size_t EpsilonArguments::conservative_max_heap_alignment() {
   return UseLargePages ? os::large_page_size() : os::vm_page_size();
@@ -52,6 +55,27 @@ void EpsilonArguments::initialize() {
   if (!EpsilonElasticTLAB && EpsilonElasticTLABDecay) {
     log_warning(gc)("Disabling EpsilonElasticTLABDecay because EpsilonElasticTLAB is disabled");
     FLAG_SET_DEFAULT(EpsilonElasticTLABDecay, false);
+  }
+
+  // Oracle mode configuration
+  if (EpsilonOracleMode) {
+    // Validate trace path is provided
+    if (EpsilonOracleTracePath == nullptr || strlen(EpsilonOracleTracePath) == 0) {
+      vm_exit_during_initialization("EpsilonOracleMode requires EpsilonOracleTracePath to be set");
+    }
+
+    // Disable TLABs - we need all allocations to go through allocate_work
+    // so we can intercept and track them with the oracle
+    if (UseTLAB) {
+      log_info(gc)("Oracle mode: Disabling TLABs for deterministic allocation tracking");
+      FLAG_SET_DEFAULT(UseTLAB, false);
+    }
+
+    // Disable TLAB-related optimizations
+    FLAG_SET_DEFAULT(EpsilonElasticTLAB, false);
+    FLAG_SET_DEFAULT(EpsilonElasticTLABDecay, false);
+
+    log_info(gc)("Oracle mode enabled with trace: %s", EpsilonOracleTracePath);
   }
 
 #ifdef COMPILER2

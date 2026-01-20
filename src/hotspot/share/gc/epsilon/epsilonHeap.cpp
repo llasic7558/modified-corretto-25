@@ -26,9 +26,12 @@
 #include "gc/epsilon/epsilonHeap.hpp"
 #include "gc/epsilon/epsilonInitLogger.hpp"
 #include "gc/epsilon/epsilonMemoryPool.hpp"
+#include "gc/epsilon/epsilonOracle.hpp"
 #include "gc/epsilon/epsilonThreadLocalData.hpp"
+#include "oops/klass.hpp"
 #include "gc/shared/gcArguments.hpp"
 #include "gc/shared/locationPrinter.inline.hpp"
+#include "gc/shared/tlab_globals.hpp"
 #include "logging/log.hpp"
 #include "memory/allocation.hpp"
 #include "memory/allocation.inline.hpp"
@@ -37,7 +40,9 @@
 #include "memory/universe.hpp"
 #include "runtime/atomic.hpp"
 #include "runtime/globals.hpp"
+#include "utilities/align.hpp"
 #include "utilities/ostream.hpp"
+#include "runtime/os.hpp"
 
 jint EpsilonHeap::initialize() {
   size_t align = HeapAlignment;
@@ -68,6 +73,23 @@ jint EpsilonHeap::initialize() {
 
   // Install barrier set
   BarrierSet::set_barrier_set(new EpsilonBarrierSet());
+
+  // Oracle mode initialization
+  if (EpsilonOracleMode) {
+    // Oracle mode requires TLABs to be disabled so we can track all allocations
+    if (UseTLAB) {
+      log_error(gc)("EpsilonOracleMode requires -XX:-UseTLAB to track all allocations");
+      return JNI_ERR;
+    }
+
+    _oracle = new EpsilonOracle();
+    if (!_oracle->load_trace(EpsilonOracleTracePath)) {
+      log_error(gc)("Failed to load oracle trace from: %s", EpsilonOracleTracePath);
+      return JNI_ERR;
+    }
+    log_info(gc)("Oracle mode: Loaded %zu entries, using malloc/free for heap allocations",
+                 _oracle->entry_count());
+  }
 
   // All done, print out the configuration
   EpsilonInitLogger::print();
@@ -105,6 +127,12 @@ EpsilonHeap* EpsilonHeap::heap() {
 HeapWord* EpsilonHeap::allocate_work(size_t size, bool verbose) {
   assert(is_object_aligned(size), "Allocation size should be aligned: %zu", size);
 
+  // Oracle mode: use malloc-based allocation
+  if (EpsilonOracleMode) {
+    return allocate_work_oracle(size, verbose);
+  }
+
+  // Standard Epsilon mode: bump-pointer allocation
   HeapWord* res = nullptr;
   while (true) {
     // Try to allocate, assume space is available
@@ -171,6 +199,110 @@ HeapWord* EpsilonHeap::allocate_work(size_t size, bool verbose) {
 
   assert(is_object_aligned(res), "Object should be aligned: " PTR_FORMAT, p2i(res));
   return res;
+}
+
+HeapWord* EpsilonHeap::allocate_work_oracle(size_t size, bool verbose) {
+  assert(EpsilonOracleMode, "Should only be called in oracle mode");
+  assert(_oracle != nullptr, "Oracle should be initialized");
+
+  // Get next global allocation sequence number (for logging)
+  uint64_t alloc_seq = _oracle->next_alloc_seq();
+
+  // Calculate size in bytes (size parameter is in HeapWords)
+  size_t size_in_bytes = size * HeapWordSize;
+
+  // Helper lambda for bump-pointer allocation with expansion
+  auto bump_allocate = [&]() -> HeapWord* {
+    HeapWord* mem = _space->par_allocate(size);
+    if (mem == nullptr) {
+      MutexLocker ml(Heap_lock);
+      mem = _space->par_allocate(size);
+      if (mem == nullptr) {
+        size_t uncommitted_space = max_capacity() - capacity();
+        size_t want_space = MAX2(size_in_bytes, EpsilonMinHeapExpand);
+        if (want_space <= uncommitted_space) {
+          bool expand = _virtual_space.expand_by(want_space);
+          assert(expand, "Should be able to expand");
+          _space->set_end((HeapWord *) _virtual_space.high());
+          mem = _space->par_allocate(size);
+        }
+      }
+    }
+    return mem;
+  };
+
+  // Check if application has started (signaled by JVMTI agent when main() is entered)
+  if (!_oracle->app_started()) {
+    // Application hasn't started yet - use standard bump-pointer allocation
+    HeapWord* mem = bump_allocate();
+    if (mem != nullptr && verbose) {
+      log_trace(gc)("Pre-app alloc #" UINT64_FORMAT ": size=%zu (waiting for main())",
+                    alloc_seq, size_in_bytes);
+    }
+    return mem;
+  }
+
+  // Get the Klass being allocated (set by MemAllocator before calling heap allocation)
+  Thread* thread = Thread::current();
+  Klass* klass = EpsilonThreadLocalData::current_alloc_klass(thread);
+  const char* type_name = nullptr;
+
+  // Need ResourceMark because external_name() allocates in resource area
+  ResourceMark rm;
+  if (klass != nullptr) {
+    type_name = klass->external_name();
+  }
+
+  // Application has started - check if this allocation matches expected trace entry
+  if (!_oracle->matches_expected_entry(size_in_bytes, type_name)) {
+    // Type/size mismatch - this is a JVM internal allocation (Strings, char[], etc.)
+    // Use bump-pointer allocation WITHOUT tracking
+    HeapWord* mem = bump_allocate();
+    if (mem != nullptr && verbose) {
+      log_trace(gc)("Untracked alloc #" UINT64_FORMAT ": type=[%s] size=%zu (JVM internal after main)",
+                    alloc_seq, type_name ? type_name : "unknown", size_in_bytes);
+    }
+    return mem;
+  }
+
+  // Size matches expected trace entry - this is an application allocation!
+  // Get the trace sequence number (1-based)
+  uint64_t trace_seq = _oracle->next_app_alloc_seq();
+
+  // Process any deaths that should happen at this trace sequence number
+  // This adds freed objects to the free list for reuse
+  _oracle->process_deaths(trace_seq);
+
+  // First, try to allocate from free list (first-fit)
+  HeapWord* mem = _oracle->allocate_from_free_list(size);
+
+  if (mem == nullptr) {
+    // No suitable free block found - use bump-pointer allocation from heap
+    mem = bump_allocate();
+
+    if (mem == nullptr) {
+      log_error(gc)("Oracle allocation failed: trace_seq=" UINT64_FORMAT " size=%zu bytes (heap exhausted)",
+                    trace_seq, size_in_bytes);
+      return nullptr;
+    }
+  }
+
+  // Zero the memory - ALWAYS required for both free list and bump-pointer allocations
+  // Free list memory may contain stale object data that must be cleared
+  memset(mem, 0, size_in_bytes);
+
+  // Register this allocation with the oracle for future deallocation
+  _oracle->register_allocation(trace_seq, mem, size_in_bytes);
+
+  // Track allocated bytes
+  Atomic::add(&_oracle_allocated_bytes, size_in_bytes);
+
+  if (verbose) {
+    log_info(gc)("Oracle TRACKED alloc: trace_seq=" UINT64_FORMAT " ptr=" PTR_FORMAT " size=%zu bytes",
+                  trace_seq, p2i(mem), size_in_bytes);
+  }
+
+  return mem;
 }
 
 HeapWord* EpsilonHeap::allocate_new_tlab(size_t min_size,
@@ -320,6 +452,14 @@ bool EpsilonHeap::print_location(outputStream* st, void* addr) const {
 void EpsilonHeap::print_tracing_info() const {
   print_heap_info(used());
   print_metaspace_info();
+
+  // Finalize and print oracle statistics if in oracle mode
+  if (EpsilonOracleMode && _oracle != nullptr) {
+    _oracle->print_stats();
+    // Finalize: free any remaining tracked objects and print final stats
+    // Cast away const since finalize modifies state (but this is shutdown)
+    const_cast<EpsilonOracle*>(_oracle)->finalize();
+  }
 }
 
 void EpsilonHeap::print_heap_info(size_t used) const {
