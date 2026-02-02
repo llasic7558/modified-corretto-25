@@ -102,7 +102,18 @@
           "Number of allocations to skip before starting oracle tracking. " \
           "Use this to skip VM bootstrap allocations when the trace only "  \
           "contains application-level allocations.")                        \
-          range(0, max_julong)
+          range(0, max_julong)                                              \
+                                                                            \
+  product(uint64_t, EpsilonOracleGracePeriod, 0, EXPERIMENTAL,              \
+          "Number of additional allocations to delay before freeing. "      \
+          "Use this to compensate for incomplete liveness traces. "         \
+          "A value of N means objects are freed N allocations later "       \
+          "than the trace specifies.")                                      \
+          range(0, max_julong)                                              \
+                                                                            \
+  product(bool, EpsilonOracleMallocMode, false, EXPERIMENTAL,               \
+          "Use actual malloc/free instead of simulated free list. "         \
+          "Requires -XX:-UseCompressedOops -XX:-UseCompressedClassPointers")
 
 // end of GC_EPSILON_FLAGS
 

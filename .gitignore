@@ -28,3 +28,9 @@ commitId.txt
 **/core.[0-9]*
 *.rej
 *.orig
+*.log
+*.class
+*.csv
+*.list
+/stability_traces
+/stress_traces

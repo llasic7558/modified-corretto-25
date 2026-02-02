@@ -30,6 +30,7 @@
 #include "gc/epsilon/epsilonMonitoringSupport.hpp"
 #include "gc/epsilon/epsilonOracle.hpp"
 #include "gc/shared/collectedHeap.hpp"
+#include "memory/metaspace.hpp"
 #include "gc/shared/softRefPolicy.hpp"
 #include "gc/shared/space.hpp"
 #include "memory/virtualspace.hpp"
@@ -53,6 +54,7 @@ private:
   // Oracle mode support
   EpsilonOracle* _oracle;
   volatile size_t _oracle_allocated_bytes;
+  bool _oracle_malloc_mode;  // Cached flag for EpsilonOracleMallocMode
 
   // Oracle allocation path (when EpsilonOracleMode is enabled)
   HeapWord* allocate_work_oracle(size_t size, bool verbose);
@@ -85,7 +87,16 @@ public:
   size_t used()         const override { return _space->used(); }
 
   bool is_in(const void* p) const override {
-    return _space->is_in(p);
+    // First check if it's in the normal heap region
+    if (_space->is_in(p)) {
+      return true;
+    }
+    // In malloc mode, only return true for pointers we've actually malloc'd
+    // This prevents treating arbitrary memory as valid Java objects
+    if (_oracle_malloc_mode && _oracle != nullptr) {
+      return _oracle->is_malloc_tracked(const_cast<void*>(p));
+    }
+    return false;
   }
 
   bool requires_barriers(stackChunkOop obj) const override { return false; }

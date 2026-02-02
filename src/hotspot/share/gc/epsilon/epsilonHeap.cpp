@@ -42,7 +42,12 @@
 #include "runtime/globals.hpp"
 #include "utilities/align.hpp"
 #include "utilities/ostream.hpp"
+#include "utilities/permitForbiddenFunctions.hpp"
 #include "runtime/os.hpp"
+#include "classfile/classLoaderData.inline.hpp"
+#include "oops/klass.hpp"
+
+#include <cinttypes>
 
 jint EpsilonHeap::initialize() {
   size_t align = HeapAlignment;
@@ -74,12 +79,29 @@ jint EpsilonHeap::initialize() {
   // Install barrier set
   BarrierSet::set_barrier_set(new EpsilonBarrierSet());
 
+  // Initialize oracle malloc mode flag (cached for is_in() method)
+  _oracle_malloc_mode = EpsilonOracleMallocMode;
+
   // Oracle mode initialization
   if (EpsilonOracleMode) {
     // Oracle mode requires TLABs to be disabled so we can track all allocations
     if (UseTLAB) {
       log_error(gc)("EpsilonOracleMode requires -XX:-UseTLAB to track all allocations");
       return JNI_ERR;
+    }
+
+    // Malloc mode requires compressed oops/class pointers to be disabled
+    // because malloc'd addresses are outside the heap region and cannot be
+    // encoded as compressed oops (32-bit offsets from heap base)
+    if (EpsilonOracleMallocMode) {
+      if (UseCompressedOops) {
+        log_error(gc)("EpsilonOracleMallocMode requires -XX:-UseCompressedOops");
+        return JNI_ERR;
+      }
+      if (UseCompressedClassPointers) {
+        log_error(gc)("EpsilonOracleMallocMode requires -XX:-UseCompressedClassPointers");
+        return JNI_ERR;
+      }
     }
 
     _oracle = new EpsilonOracle();
@@ -205,8 +227,8 @@ HeapWord* EpsilonHeap::allocate_work_oracle(size_t size, bool verbose) {
   assert(EpsilonOracleMode, "Should only be called in oracle mode");
   assert(_oracle != nullptr, "Oracle should be initialized");
 
-  // Get next global allocation sequence number (for logging)
-  uint64_t alloc_seq = _oracle->next_alloc_seq();
+  // Get OS thread ID for per-thread tracking
+  int64_t thread_id = os::current_thread_id();
 
   // Calculate size in bytes (size parameter is in HeapWords)
   size_t size_in_bytes = size * HeapWordSize;
@@ -231,58 +253,112 @@ HeapWord* EpsilonHeap::allocate_work_oracle(size_t size, bool verbose) {
     return mem;
   };
 
-  // Check if application has started (signaled by JVMTI agent when main() is entered)
+  // Before app starts, use bump-pointer allocation without tracking
+  // (JVM bootstrap allocations are not in the trace)
   if (!_oracle->app_started()) {
-    // Application hasn't started yet - use standard bump-pointer allocation
+    _oracle->count_pre_app_alloc();
+
+    // Auto-start after EpsilonOracleSkipAllocs allocations
+    if (_oracle->total_alloc_count() >= EpsilonOracleSkipAllocs) {
+      _oracle->signal_app_start();
+      log_info(gc)("Oracle: Auto-started after " UINT64_FORMAT " allocations (EpsilonOracleSkipAllocs=" UINT64_FORMAT ")",
+                   _oracle->total_alloc_count(), EpsilonOracleSkipAllocs);
+    }
+
     HeapWord* mem = bump_allocate();
-    if (mem != nullptr && verbose) {
-      log_trace(gc)("Pre-app alloc #" UINT64_FORMAT ": size=%zu (waiting for main())",
-                    alloc_seq, size_in_bytes);
+    if (verbose && mem != nullptr) {
+      log_trace(gc)("Oracle PRE-APP alloc: thread=" INT64_FORMAT " ptr=" PTR_FORMAT " size=%zu bytes",
+                    thread_id, p2i(mem), size_in_bytes);
     }
     return mem;
   }
 
-  // Get the Klass being allocated (set by MemAllocator before calling heap allocation)
-  Thread* thread = Thread::current();
-  Klass* klass = EpsilonThreadLocalData::current_alloc_klass(thread);
-  const char* type_name = nullptr;
+  // Application has started - use per-thread sequential matching
+  // The N-th allocation on thread T matches the N-th oracle entry for thread T
+  // But ONLY for application allocations (signaled by JVMTI agent)
 
-  // Need ResourceMark because external_name() allocates in resource area
-  ResourceMark rm;
-  if (klass != nullptr) {
-    type_name = klass->external_name();
-  }
+  // Check if this is an application allocation (signaled by OracleSignal agent)
+  Thread* current_thread = Thread::current();
+  bool is_app_allocation = EpsilonThreadLocalData::app_allocation_pending(current_thread);
 
-  // Application has started - check if this allocation matches expected trace entry
-  if (!_oracle->matches_expected_entry(size_in_bytes, type_name)) {
-    // Type/size mismatch - this is a JVM internal allocation (Strings, char[], etc.)
-    // Use bump-pointer allocation WITHOUT tracking
+  // If not an application allocation, just do bump-pointer allocation without tracking
+  if (!is_app_allocation) {
     HeapWord* mem = bump_allocate();
-    if (mem != nullptr && verbose) {
-      log_trace(gc)("Untracked alloc #" UINT64_FORMAT ": type=[%s] size=%zu (JVM internal after main)",
-                    alloc_seq, type_name ? type_name : "unknown", size_in_bytes);
+    if (verbose && mem != nullptr) {
+      log_trace(gc)("Oracle SYSTEM alloc (not tracked): thread=%" PRId64 " ptr=" PTR_FORMAT
+                    " size=%zu bytes",
+                    thread_id, p2i(mem), size_in_bytes);
     }
     return mem;
   }
 
-  // Size matches expected trace entry - this is an application allocation!
-  // Get the trace sequence number (1-based)
-  uint64_t trace_seq = _oracle->next_app_alloc_seq();
+  // This is an application allocation (signaled by agent) - track it with the oracle
+  // Get next per-thread allocation sequence number (1-based)
+  // This also maps the runtime thread to a logical thread ID
+  uint64_t per_thread_seq = _oracle->next_thread_alloc_seq(thread_id);
 
-  // Process any deaths that should happen at this trace sequence number
+  // Get logical thread ID (should be valid since next_thread_alloc_seq just mapped it)
+  int32_t logical_thread = _oracle->get_logical_thread(thread_id);
+  if (logical_thread < 0) {
+    // Thread not mapped - shouldn't happen if app started
+    log_trace(gc)("Oracle: Thread %" PRId64 " not mapped to logical thread", thread_id);
+    HeapWord* mem = bump_allocate();
+    return mem;
+  }
+
+  HeapWord* mem = nullptr;
+
+  if (EpsilonOracleMallocMode) {
+    // MALLOC MODE: Use actual malloc/free for true memory management measurement
+
+    // Process deaths with actual free() for this logical thread at this sequence
+    _oracle->process_deaths_malloc_mode(logical_thread, per_thread_seq);
+
+    // Allocate with actual malloc
+    void* malloc_mem = permit_forbidden_function::malloc(size_in_bytes);
+    if (malloc_mem == nullptr) {
+      log_error(gc)("Oracle MALLOC allocation failed: thread=" INT64_FORMAT " seq=" UINT64_FORMAT " size=%zu bytes",
+                    thread_id, per_thread_seq, size_in_bytes);
+      return nullptr;
+    }
+
+    // Zero memory (required for object initialization)
+    memset(malloc_mem, 0, size_in_bytes);
+
+    // Track this malloc'd pointer
+    _oracle->track_malloc_ptr(malloc_mem, size_in_bytes);
+
+    // Register for future deallocation (returns true if matched oracle entry)
+    bool matched = _oracle->register_allocation(thread_id, malloc_mem, size_in_bytes);
+
+    // Track allocated bytes
+    Atomic::add(&_oracle_allocated_bytes, size_in_bytes);
+
+    if (verbose) {
+      log_info(gc)("Oracle MALLOC alloc: thread=" INT64_FORMAT " seq=" UINT64_FORMAT " ptr=" PTR_FORMAT
+                   " size=%zu bytes matched=%s",
+                   thread_id, per_thread_seq, p2i(malloc_mem), size_in_bytes, matched ? "true" : "false");
+    }
+
+    return (HeapWord*)malloc_mem;
+  }
+
+  // FREE-LIST MODE: Use in-heap free list simulation (default)
+
+  // Process any deaths that should happen at this per-thread sequence number
   // This adds freed objects to the free list for reuse
-  _oracle->process_deaths(trace_seq);
+  _oracle->process_deaths(logical_thread, per_thread_seq);
 
   // First, try to allocate from free list (first-fit)
-  HeapWord* mem = _oracle->allocate_from_free_list(size);
+  mem = _oracle->allocate_from_free_list(size);
 
   if (mem == nullptr) {
     // No suitable free block found - use bump-pointer allocation from heap
     mem = bump_allocate();
 
     if (mem == nullptr) {
-      log_error(gc)("Oracle allocation failed: trace_seq=" UINT64_FORMAT " size=%zu bytes (heap exhausted)",
-                    trace_seq, size_in_bytes);
+      log_error(gc)("Oracle allocation failed: thread=" INT64_FORMAT " seq=" UINT64_FORMAT " size=%zu bytes (heap exhausted)",
+                    thread_id, per_thread_seq, size_in_bytes);
       return nullptr;
     }
   }
@@ -292,14 +368,15 @@ HeapWord* EpsilonHeap::allocate_work_oracle(size_t size, bool verbose) {
   memset(mem, 0, size_in_bytes);
 
   // Register this allocation with the oracle for future deallocation
-  _oracle->register_allocation(trace_seq, mem, size_in_bytes);
+  bool matched = _oracle->register_allocation(thread_id, mem, size_in_bytes);
 
   // Track allocated bytes
   Atomic::add(&_oracle_allocated_bytes, size_in_bytes);
 
   if (verbose) {
-    log_info(gc)("Oracle TRACKED alloc: trace_seq=" UINT64_FORMAT " ptr=" PTR_FORMAT " size=%zu bytes",
-                  trace_seq, p2i(mem), size_in_bytes);
+    log_info(gc)("Oracle alloc: thread=" INT64_FORMAT " seq=" UINT64_FORMAT " ptr=" PTR_FORMAT
+                 " size=%zu bytes matched=%s",
+                 thread_id, per_thread_seq, p2i(mem), size_in_bytes, matched ? "true" : "false");
   }
 
   return mem;

@@ -36,11 +36,13 @@ private:
   size_t _ergo_tlab_size;
   int64_t _last_tlab_time;
   Klass* _current_alloc_klass;  // For oracle mode: Klass being allocated
+  bool _app_allocation_pending; // For oracle mode: true if next alloc is from app code
 
   EpsilonThreadLocalData() :
           _ergo_tlab_size(0),
           _last_tlab_time(0),
-          _current_alloc_klass(nullptr) {}
+          _current_alloc_klass(nullptr),
+          _app_allocation_pending(false) {}
 
   static EpsilonThreadLocalData* data(Thread* thread) {
     assert(UseEpsilonGC, "Sanity");
@@ -79,6 +81,16 @@ public:
 
   static void set_current_alloc_klass(Thread* thread, Klass* klass) {
     data(thread)->_current_alloc_klass = klass;
+  }
+
+  // Oracle mode: application allocation pending flag
+  // Set by JVMTI agent before application code allocates, cleared after
+  static bool app_allocation_pending(Thread* thread) {
+    return data(thread)->_app_allocation_pending;
+  }
+
+  static void set_app_allocation_pending(Thread* thread, bool pending) {
+    data(thread)->_app_allocation_pending = pending;
   }
 };
 

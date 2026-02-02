@@ -76,6 +76,19 @@ void EpsilonArguments::initialize() {
     FLAG_SET_DEFAULT(EpsilonElasticTLABDecay, false);
 
     log_info(gc)("Oracle mode enabled with trace: %s", EpsilonOracleTracePath);
+
+    // Oracle malloc mode validation
+    if (EpsilonOracleMallocMode) {
+      if (UseCompressedOops) {
+        vm_exit_during_initialization(
+          "EpsilonOracleMallocMode requires -XX:-UseCompressedOops");
+      }
+      if (UseCompressedClassPointers) {
+        vm_exit_during_initialization(
+          "EpsilonOracleMallocMode requires -XX:-UseCompressedClassPointers");
+      }
+      log_info(gc)("Oracle MALLOC mode: using actual malloc/free");
+    }
   }
 
 #ifdef COMPILER2
