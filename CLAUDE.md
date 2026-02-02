@@ -117,3 +117,88 @@ Incremental rebuilds: Most targets support `-only` suffix (e.g., `make test-tier
 - Run `make test-tier1` before submitting PRs
 - Problem tests tracked in `test/ProblemList*.txt`
 - Security issues: report via AWS vulnerability reporting, not GitHub issues
+
+## Oracle GC (Experimental)
+
+This fork includes experimental modifications to Epsilon GC for oracular memory management research, implementing the methodology from "Quantifying the Performance of Garbage Collection vs. Explicit Memory Management" (Hertz & Berger, OOPSLA 2005).
+
+### Overview
+
+Oracle GC modifies Epsilon to use malloc/free instead of garbage collection, guided by a pre-computed oracle trace that specifies when each object should be freed.
+
+### Modified Files
+
+```
+src/hotspot/share/gc/epsilon/
+├── epsilonOracle.hpp      # Oracle data structures and API
+├── epsilonOracle.cpp      # Oracle implementation (trace loading, death scheduling)
+├── epsilonHeap.cpp        # Modified allocation path for oracle mode
+├── epsilonThreadLocalData.hpp  # Thread-local storage for allocation tracking
+├── epsilon_globals.hpp    # JVM flags for oracle mode
+```
+
+### Building
+
+```bash
+# Standard build (includes Oracle GC modifications)
+bash configure
+make CONF=release images
+
+# Debug build for development
+bash configure --enable-debug
+make images
+```
+
+### JVM Flags
+
+| Flag | Description |
+|------|-------------|
+| `-XX:+EpsilonOracleMode` | Enable oracle-based memory management |
+| `-XX:EpsilonOracleTracePath=<path>` | Path to oracle CSV file |
+| `-XX:+EpsilonOracleMallocMode` | Use actual malloc/free instead of free-list |
+| `-XX:-UseTLAB` | **Required** - disable TLABs to track all allocations |
+
+### Running with Oracle GC
+
+```bash
+# Requires Oracle Signal Agent for application allocation filtering
+./build/*/images/jdk/bin/java \
+    -XX:+UnlockExperimentalVMOptions \
+    -XX:+UseEpsilonGC \
+    -XX:-UseTLAB \
+    -XX:+EpsilonOracleMode \
+    -XX:EpsilonOracleTracePath=oracle.csv \
+    -Djava.library.path=/path/to/oracle-signal-agent \
+    --enable-native-access=ALL-UNNAMED \
+    -javaagent:/path/to/oracle-signal-agent.jar \
+    -cp myapp.jar MyApp
+```
+
+### Oracle File Format
+
+Per-thread format with logical thread IDs:
+
+```csv
+alloc_thread,alloc_seq,free_thread,free_seq,size,type,obj_id
+0,1,0,2,24,java.util.ArrayList,357863579
+0,2,0,3,16,java.lang.Object,114132791
+```
+
+- `alloc_thread`: Logical thread ID that allocated (0, 1, 2, ...)
+- `alloc_seq`: Per-thread allocation sequence (1, 2, 3, ...)
+- `free_thread`: Logical thread ID whose allocation triggers free
+- `free_seq`: Sequence number at which to free
+- `size`: Object size in bytes (for debugging)
+- `type`: Class name (for debugging)
+
+### Key Implementation Details
+
+1. **Thread ID Remapping**: Runtime OS thread IDs are mapped to logical IDs (0, 1, 2, ...) based on first allocation order
+2. **Application Allocation Filtering**: JVMTI agent signals application allocations to distinguish from JVM internals
+3. **Death Scheduling**: Objects freed when specified thread reaches specified allocation sequence number
+
+### Related Projects
+
+- **Oracle Signal Agent** (`../oracle-signal-agent/`): JVMTI agent for filtering application allocations
+- **Oracle Generator** (`../oracle_generator.py`): Converts Elephant Tracks traces to oracle format
+- **Elephant Tracks** (`../elephant-tracks/`): JVMTI agent for trace collection
