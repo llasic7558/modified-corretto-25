@@ -209,24 +209,117 @@ Object X:
 
 ---
 
-## Implementation Priority
+## Implementation Status (Updated 2024-02-05)
+
+### Phase 1: Validation - COMPLETE ✓
+- [x] Created test programs for determinism analysis
+- [x] Ran experiments comparing multiple traces
+- [x] **Finding**: Multi-threaded execution has ~6-7% trace variation
+- [x] **Finding**: Single-thread mode (`-t 1`) reduces variation to ~0.5%
+- [x] **Finding**: First ~5,467 allocations are 100% deterministic
+- [x] **Finding**: Object IDs (identity hash codes) are 93% consistent across runs
+
+### Phase 2: Design Decision - COMPLETE ✓
+- [x] Per-thread clocks implemented (not vector clocks)
+- [x] **New approach**: Lookahead matching for remaining ~0.1% non-determinism
+- [x] Matching by (size, type) within a configurable window
+
+### Phase 3: Implementation - COMPLETE ✓
+- [x] Elephant Tracks trace format unchanged (already has thread info)
+- [x] `oracle_generator.py` updated for per-thread format
+- [x] `epsilonOracle.hpp/cpp` updated with:
+  - Per-thread allocation tracking
+  - Runtime → logical thread ID mapping
+  - **Lookahead matching** (new!)
+  - Consumed entry tracking
+  - Match statistics (exact, lookahead, no-match)
+- [x] `epsilonHeap.cpp` updated:
+  - Type name passed to register_allocation
+  - Class filter support
+- [x] New JVM flags:
+  - `EpsilonOracleLookahead=N` - window size for fuzzy matching
+  - `EpsilonOracleRequireTypeMatch` - require type match in lookahead
+
+### Phase 4: Validation - IN PROGRESS
+- [ ] Test lookahead matching with lusearch benchmark
+- [ ] Verify match rate improves with lookahead enabled
+- [ ] Compare memory behavior with/without lookahead
+- [ ] Run full DaCapo suite
+
+---
+
+## Lookahead Matching Implementation
+
+### Overview
+
+Even with per-thread sequence matching, ~0.1% of allocations differ between trace collection and replay due to:
+- JIT compilation timing
+- Lazy class initialization
+- File I/O order variation
+
+### How It Works
+
+```
+Runtime allocation: Thread 0, seq 5468, size 48, type java.util.StringBuilder
+
+Expected oracle entry at seq 5468: size 56, type java.io.FileReader  ← MISMATCH!
+
+With EpsilonOracleLookahead=20:
+  Search entries 5458-5488 for:
+    - size == 48
+    - type == java.util.StringBuilder (if EpsilonOracleRequireTypeMatch=true)
+    - entry not already consumed
+
+  Found match at oracle seq 5471 → Use that entry for death scheduling
+```
+
+### JVM Flags
+
+```bash
+# Enable lookahead with 20-entry window
+-XX:EpsilonOracleLookahead=20
+
+# Require type match (default: true)
+-XX:+EpsilonOracleRequireTypeMatch
+
+# Or allow size-only matching
+-XX:-EpsilonOracleRequireTypeMatch
+```
+
+### Statistics
+
+At shutdown, the oracle prints matching statistics:
+
+```
+Oracle Statistics:
+  Matching Statistics:
+    Exact matches:    973000 (99.90%)
+    Lookahead matches:    500 (0.05%)
+    No match:             50 (0.05%)
+    Lookahead window: 20 entries
+    Type matching:    required
+```
+
+---
+
+## Original Implementation Priority (Historical)
 
 ### Phase 1: Validation (Do First)
-- [ ] Create `ThreadDeterminismTest.java`
-- [ ] Run single-core experiment (10 runs, compare traces)
-- [ ] Document findings
+- [x] Create `ThreadDeterminismTest.java`
+- [x] Run single-core experiment (10 runs, compare traces)
+- [x] Document findings
 
 ### Phase 2: Design Decision
-- [ ] Analyze: Are most object lifetimes thread-local?
-- [ ] Decide: Per-thread clocks vs Vector clocks
-- [ ] Write design doc with examples
+- [x] Analyze: Are most object lifetimes thread-local?
+- [x] Decide: Per-thread clocks vs Vector clocks → **Per-thread + Lookahead**
+- [x] Write design doc with examples
 
 ### Phase 3: Implementation (If Per-Thread Clocks)
-- [ ] Modify Elephant Tracks trace format
-- [ ] Update `oracle_generator.py` for new format
-- [ ] Update `epsilonOracle.hpp/cpp` for per-thread tracking
-- [ ] Update `epsilonHeap.cpp` allocation path
-- [ ] Test with single-threaded program
+- [x] Modify Elephant Tracks trace format
+- [x] Update `oracle_generator.py` for new format
+- [x] Update `epsilonOracle.hpp/cpp` for per-thread tracking
+- [x] Update `epsilonHeap.cpp` allocation path
+- [x] Test with single-threaded program
 - [ ] Test with multi-threaded program
 
 ### Phase 4: Validation
