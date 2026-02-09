@@ -78,12 +78,12 @@ This implements the methodology from:
 | `EpsilonOracleTracePath` | string | null | **Required**: Path to oracle CSV file |
 | `EpsilonOracleValidate` | bool | false | Validate allocation sizes against trace |
 | `EpsilonOracleGracePeriod` | uint64 | 0 | Delay freeing by N allocations |
-| `EpsilonOracleMallocMode` | bool | false | Use real malloc/free (not free list) |
+| `EpsilonOracleMallocMode` | bool | true | Use real malloc/free (auto-disables compressed oops) |
 | `EpsilonOracleSkipAllocs` | uint64 | 0 | Skip N allocations (deprecated) |
 
 **Required JVM flags**:
 - `-XX:-UseTLAB` (always required for deterministic tracking)
-- `-XX:-UseCompressedOops -XX:-UseCompressedClassPointers` (only for malloc mode)
+- Compressed oops/class pointers are auto-disabled when malloc mode is on
 
 ---
 

@@ -74,12 +74,43 @@ struct MallocPtrBucket {
   MallocPtrBucket* next;   // Next in hash chain
 };
 
+// Orphan entry: oracle entry that was skipped during lookahead,
+// stored for potential future matching by size
+struct OrphanEntry {
+  size_t   size;           // Object size (matching signal)
+  uint64_t alloc_seq;      // Original alloc_seq from trace
+  uint64_t free_seq;       // Original free_seq from trace
+  int32_t  free_thread;    // Original free_thread from trace
+  int32_t  alloc_thread;   // Original alloc_thread from trace
+  uint64_t lifetime;       // Precomputed: free_seq - alloc_seq (same-thread) or 0
+  OrphanEntry* next;       // Next in linked list
+};
+
+// Statistics for resilient oracle matching
+struct OracleMatchingStats {
+  volatile uint64_t perfect_matches;     // Cursor entry matched size exactly
+  volatile uint64_t lookahead_matches;   // Found match by scanning ahead
+  volatile uint64_t orphan_matches;      // Found match in orphan pool
+  volatile uint64_t estimated_deaths;    // Used cursor entry's lifetime as fallback
+  volatile uint64_t oracle_exhausted;    // Oracle ran out for thread
+  volatile uint64_t total_skipped;       // Entries pushed to orphan pool
+};
+
 // Per-thread allocation state (keyed by LOGICAL thread ID)
 struct ThreadAllocState {
   int32_t  logical_thread; // LOGICAL thread ID (0, 1, 2, ...)
   uint64_t alloc_count;    // Number of allocations on this thread
-  size_t   next_entry_idx; // Next oracle entry index for this thread
+  size_t   next_entry_idx; // Next oracle entry index (cursor) for this thread
   ThreadAllocState* next;  // Next in hash chain
+
+  // Orphan pool: skipped oracle entries stored for future matching
+  OrphanEntry* orphan_pool;   // Per-thread orphan pool (linked list)
+  size_t   orphan_count;      // Pool size
+
+  // Running average lifetime for fallback estimation
+  uint64_t avg_lifetime;      // Running average lifetime
+  uint64_t lifetime_sum;      // Sum for computing average
+  uint64_t lifetime_count;    // Count for computing average
 };
 
 // Oracle-based memory manager for deterministic malloc/free
@@ -93,10 +124,11 @@ struct ThreadAllocState {
 // Key insight: Per-thread allocation order IS deterministic even when
 // global thread interleaving varies.
 //
-// Matching strategy: Pure sequential per-thread
-//   - N-th allocation on thread T matches N-th oracle entry for thread T
-//   - No type matching needed (unlike the previous implementation)
-//   - Objects freed when specified thread reaches specified per-thread sequence
+// Matching strategy: Resilient per-thread with lookahead and orphan pool
+//   - Primary: N-th allocation on thread T matches N-th oracle entry for thread T
+//   - On size mismatch: lookahead scan up to K entries ahead
+//   - Skipped entries stored in orphan pool for future matching
+//   - Fallback: estimated death times with configurable safety delta
 class EpsilonOracle : public CHeapObj<mtGC> {
 private:
   // Oracle entries loaded from trace file (sorted by alloc_thread, alloc_seq)
@@ -151,6 +183,12 @@ private:
   volatile size_t _malloc_tracked_count;
   volatile size_t _malloc_freed_count;
 
+  // Resilient matching statistics
+  OracleMatchingStats _matching_stats;
+
+  // Maximum orphan pool entries per thread
+  static const size_t MAX_ORPHAN_POOL_SIZE = 1024;
+
   // Mutex for thread-safe access to thread map and death map
   Mutex* _oracle_lock;
 
@@ -184,6 +222,35 @@ private:
   // Find oracle entry for logical thread at given per-thread sequence
   // Returns entry index or SIZE_MAX if not found
   size_t find_entry_for_thread(int32_t logical_thread, uint64_t per_thread_seq);
+
+  // --- Resilient matching helpers ---
+
+  // Schedule death using original oracle entry's (free_thread, free_seq)
+  void schedule_death_original(OracleEntry& entry, void* ptr, size_t size);
+
+  // Schedule death using estimated sequence on the allocating thread
+  void schedule_death_estimated(int32_t alloc_thread, uint64_t estimated_seq, void* ptr, size_t size);
+
+  // Compute estimated death time from an orphan entry or oracle entry
+  uint64_t compute_estimated_death(uint64_t lifetime, uint64_t current_seq,
+                                   ThreadAllocState* state);
+
+  // Orphan pool management
+  void push_to_orphan_pool(ThreadAllocState* state, OracleEntry& entry);
+  OrphanEntry* find_in_orphan_pool(ThreadAllocState* state, size_t size);
+  void remove_from_orphan_pool(ThreadAllocState* state, OrphanEntry* orphan, OrphanEntry* prev);
+
+  // Update running average lifetime statistics
+  void update_lifetime_stats(ThreadAllocState* state, OracleEntry& entry);
+
+  // Check if cursor has entries remaining for this thread
+  bool cursor_has_entries(ThreadAllocState* state, int32_t logical_thread) const;
+
+  // Get the oracle entry at the cursor position for this thread
+  OracleEntry& cursor_entry(ThreadAllocState* state) const;
+
+  // Advance cursor past the current entry
+  void advance_cursor(ThreadAllocState* state);
 
 public:
   EpsilonOracle();

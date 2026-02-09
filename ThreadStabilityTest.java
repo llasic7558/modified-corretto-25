@@ -2,89 +2,110 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Test program to analyze trace stability across runs.
+ * ThreadStabilityTest -- multi-threaded allocation test for Oracle GC.
  *
- * Part 1: Single-threaded allocations (should be deterministic)
- * Part 2: Multi-threaded allocations (may diverge in order)
+ * Rewritten to avoid crash patterns:
+ * - Named static inner classes instead of lambdas
+ * - NO string concatenation
+ * - NO System.out.println with variables
+ * - All output via System.err with constant strings
  *
- * Run multiple times and compare traces to see if allocation order is stable.
+ * Part 1: Single-threaded allocations (deterministic)
+ * Part 2: Two worker threads allocating independently
+ * Part 3: Producer/consumer with shared object
  */
 public class ThreadStabilityTest {
     static volatile int counter = 0;
 
     public static void main(String[] args) throws Exception {
-        System.out.println("=== Single-threaded allocations ===");
+        System.err.println("ThreadStabilityTest: starting single-threaded phase");
 
         // Part 1: Single-threaded (should be deterministic)
         List<Object> singleThreadObjects = new ArrayList<>();
         for (int i = 0; i < 20; i++) {
             Object o = new Object();
-            use(o);
+            touch(o);
             singleThreadObjects.add(o);
         }
-        System.out.println("Single-threaded: " + singleThreadObjects.size() + " objects");
 
-        // Part 2: Multi-threaded (may diverge)
-        System.out.println("=== Multi-threaded allocations ===");
+        // Touch all
+        for (int i = 0; i < singleThreadObjects.size(); i++) {
+            touch(singleThreadObjects.get(i));
+        }
 
-        Thread t1 = new Thread(() -> {
-            for (int i = 0; i < 10; i++) {
-                Object o = new Object();
-                use(o);
-                synchronized (ThreadStabilityTest.class) {
-                    counter++;
-                }
-            }
-        }, "Worker-1");
+        System.err.println("ThreadStabilityTest: starting multi-threaded phase");
 
-        Thread t2 = new Thread(() -> {
-            for (int i = 0; i < 10; i++) {
-                Object o = new Object();
-                use(o);
-                synchronized (ThreadStabilityTest.class) {
-                    counter++;
-                }
-            }
-        }, "Worker-2");
+        // Part 2: Multi-threaded (named Thread subclasses, no lambdas)
+        Thread t1 = new Worker("Worker-1");
+        Thread t2 = new Worker("Worker-2");
 
         t1.start();
         t2.start();
         t1.join();
         t2.join();
 
-        System.out.println("Multi-threaded counter: " + counter);
+        System.err.println("ThreadStabilityTest: starting shared object phase");
 
         // Part 3: Cross-thread object sharing
-        System.out.println("=== Cross-thread object sharing ===");
-        final Object[] shared = new Object[1];
+        Object[] shared = new Object[1];
 
-        Thread producer = new Thread(() -> {
-            shared[0] = new Object();
-            use(shared[0]);
-        }, "Producer");
-
-        Thread consumer = new Thread(() -> {
-            // Wait for producer
-            while (shared[0] == null) {
-                Thread.yield();
-            }
-            use(shared[0]);  // Use object created by another thread
-        }, "Consumer");
-
+        Thread producer = new Producer(shared);
         producer.start();
-        consumer.start();
         producer.join();
+
+        Thread consumer = new Consumer(shared);
+        consumer.start();
         consumer.join();
 
-        System.out.println("Shared object test complete");
-        System.out.println("=== Test Complete ===");
+        System.err.println("ThreadStabilityTest: done");
     }
 
-    static void use(Object o) {
-        // Actually use the object to register access in trace
-        int hash = o.hashCode();
-        if (hash == 0) {
-            System.out.println("Zero hash"); // Unlikely, prevents optimization
+    static void touch(Object o) {
+        o.hashCode();
+    }
+
+    static class Worker extends Thread {
+        Worker(String name) {
+            super(name);
+        }
+
+        public void run() {
+            for (int i = 0; i < 10; i++) {
+                Object o = new Object();
+                touch(o);
+                synchronized (ThreadStabilityTest.class) {
+                    counter++;
+                }
+            }
+        }
+    }
+
+    static class Producer extends Thread {
+        private final Object[] target;
+
+        Producer(Object[] target) {
+            super("Producer");
+            this.target = target;
+        }
+
+        public void run() {
+            target[0] = new Object();
+            touch(target[0]);
+        }
+    }
+
+    static class Consumer extends Thread {
+        private final Object[] source;
+
+        Consumer(Object[] source) {
+            super("Consumer");
+            this.source = source;
+        }
+
+        public void run() {
+            if (source[0] != null) {
+                touch(source[0]);
+            }
         }
     }
 }

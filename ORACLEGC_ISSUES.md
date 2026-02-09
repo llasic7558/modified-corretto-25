@@ -11,7 +11,7 @@ After reviewing the current OracleGC implementation, I've identified several iss
 | Severity | Issue | Status |
 |----------|-------|--------|
 | 🔴 CRITICAL | `is_in()` too permissive in malloc mode | Needs Fix |
-| 🔴 CRITICAL | Missing CompressedOops enforcement | Needs Fix |
+| ✅ FIXED | CompressedOops auto-disabled in malloc mode | Fixed |
 | 🟡 MODERATE | Thread safety in type index | Should Fix |
 | 🟡 MODERATE | `object_iterate` broken in malloc mode | Should Fix |
 | 🟢 MINOR | No coalescing in free list | Acceptable |
@@ -67,35 +67,9 @@ bool is_in(const void* p) const override {
 
 ---
 
-### Issue 2: Missing CompressedOops/CompressedClassPointers Enforcement
+### Issue 2: ~~Missing CompressedOops/CompressedClassPointers Enforcement~~ FIXED
 
-**Location**: `epsilon_globals.hpp:114-116`
-
-```cpp
-product(bool, EpsilonOracleMallocMode, false, EXPERIMENTAL,
-        "Use actual malloc/free instead of simulated free list. "
-        "Requires -XX:-UseCompressedOops -XX:-UseCompressedClassPointers")
-```
-
-**Problem**: The comment says these flags are required, but there's no runtime check. With compressed oops:
-- Object references are stored as 32-bit offsets from heap base
-- Malloc'd addresses (outside heap region) cannot be encoded as compressed oops
-- This causes incorrect pointer storage → crashes
-
-**Fix Needed**: Add validation in `epsilonHeap.cpp:initialize()`:
-
-```cpp
-if (EpsilonOracleMallocMode) {
-  if (UseCompressedOops) {
-    log_error(gc)("EpsilonOracleMallocMode requires -XX:-UseCompressedOops");
-    return JNI_ERR;
-  }
-  if (UseCompressedClassPointers) {
-    log_error(gc)("EpsilonOracleMallocMode requires -XX:-UseCompressedClassPointers");
-    return JNI_ERR;
-  }
-}
-```
+**Status**: Fixed. Malloc mode is now the default (`EpsilonOracleMallocMode=true`). The JVM auto-disables `UseCompressedOops` and `UseCompressedClassPointers` at startup when malloc mode is active. No user action required.
 
 ---
 

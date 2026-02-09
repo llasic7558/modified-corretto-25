@@ -92,15 +92,16 @@ jint EpsilonHeap::initialize() {
 
     // Malloc mode requires compressed oops/class pointers to be disabled
     // because malloc'd addresses are outside the heap region and cannot be
-    // encoded as compressed oops (32-bit offsets from heap base)
+    // encoded as compressed oops (32-bit offsets from heap base).
+    // Auto-disable them when oracle mode is active with malloc mode.
     if (EpsilonOracleMallocMode) {
       if (UseCompressedOops) {
-        log_error(gc)("EpsilonOracleMallocMode requires -XX:-UseCompressedOops");
-        return JNI_ERR;
+        log_info(gc)("Oracle malloc mode: auto-disabling UseCompressedOops");
+        FLAG_SET_CMDLINE(UseCompressedOops, false);
       }
       if (UseCompressedClassPointers) {
-        log_error(gc)("EpsilonOracleMallocMode requires -XX:-UseCompressedClassPointers");
-        return JNI_ERR;
+        log_info(gc)("Oracle malloc mode: auto-disabling UseCompressedClassPointers");
+        FLAG_SET_CMDLINE(UseCompressedClassPointers, false);
       }
     }
 
@@ -111,6 +112,9 @@ jint EpsilonHeap::initialize() {
     }
     log_info(gc)("Oracle mode: Loaded %zu entries, using malloc/free for heap allocations",
                  _oracle->entry_count());
+    log_info(gc)("Oracle mode: Resilient matching enabled, lookahead=%zu, death_delta=" UINT64_FORMAT
+                 ", global_delta=" UINT64_FORMAT,
+                 EpsilonOracleLookahead, EpsilonOracleDeathDelta, EpsilonOracleGlobalDelta);
   }
 
   // All done, print out the configuration
@@ -278,8 +282,9 @@ HeapWord* EpsilonHeap::allocate_work_oracle(size_t size, bool verbose) {
   // But ONLY for application allocations (signaled by JVMTI agent)
 
   // Check if this is an application allocation (signaled by OracleSignal agent)
+  // Uses depth counter (preferred) or legacy boolean flag
   Thread* current_thread = Thread::current();
-  bool is_app_allocation = EpsilonThreadLocalData::app_allocation_pending(current_thread);
+  bool is_app_allocation = EpsilonThreadLocalData::in_app_code(current_thread);
 
   // If not an application allocation, just do bump-pointer allocation without tracking
   if (!is_app_allocation) {

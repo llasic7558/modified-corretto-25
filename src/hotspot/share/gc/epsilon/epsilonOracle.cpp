@@ -62,6 +62,9 @@ EpsilonOracle::EpsilonOracle() :
   _malloc_freed_count(0),
   _oracle_lock(nullptr) {
 
+  // Initialize matching stats
+  memset(&_matching_stats, 0, sizeof(_matching_stats));
+
   // Create mutex for thread-safe access
   _oracle_lock = new Mutex(Mutex::nosafepoint, "EpsilonOracle_lock");
 
@@ -321,6 +324,15 @@ ThreadAllocState* EpsilonOracle::get_or_create_thread_state(int32_t logical_thre
   state->next_entry_idx = _thread_entry_index[logical_thread].first_entry_idx;
   state->next = nullptr;
 
+  // Initialize orphan pool
+  state->orphan_pool = nullptr;
+  state->orphan_count = 0;
+
+  // Initialize lifetime tracking
+  state->avg_lifetime = 100;  // Cold start default
+  state->lifetime_sum = 0;
+  state->lifetime_count = 0;
+
   _thread_states[logical_thread] = state;
 
   log_debug(gc)("Oracle: Created state for logical thread %d, first_entry_idx=%zu",
@@ -382,47 +394,30 @@ uint64_t EpsilonOracle::next_thread_alloc_seq(int64_t runtime_thread_id) {
   return new_count;
 }
 
-bool EpsilonOracle::register_allocation(int64_t runtime_thread_id, void* ptr, size_t size) {
-  // Map runtime thread to logical thread
-  int32_t logical_thread = get_logical_thread(runtime_thread_id);
-  if (logical_thread < 0) {
-    // Thread not mapped yet - shouldn't happen if called after next_thread_alloc_seq
-    log_trace(gc)("Oracle: register_allocation called for unmapped thread %" PRId64, runtime_thread_id);
+// --- Resilient matching helpers ---
+
+bool EpsilonOracle::cursor_has_entries(ThreadAllocState* state, int32_t logical_thread) const {
+  if (logical_thread < 0 || (size_t)logical_thread >= MAX_LOGICAL_THREADS) {
     return false;
   }
+  const ThreadEntryIndex& idx = _thread_entry_index[logical_thread];
+  size_t end_idx = idx.first_entry_idx + idx.entry_count;
+  return state->next_entry_idx < end_idx;
+}
 
-  // Get thread state
-  ThreadAllocState* state = get_or_create_thread_state(logical_thread);
-  if (state == nullptr) {
-    return false;
-  }
-  uint64_t per_thread_seq = state->alloc_count;  // Already incremented by caller
+OracleEntry& EpsilonOracle::cursor_entry(ThreadAllocState* state) const {
+  return _entries[state->next_entry_idx];
+}
 
-  // Find the oracle entry for this logical thread at this sequence
-  size_t entry_idx = find_entry_for_thread(logical_thread, per_thread_seq);
+void EpsilonOracle::advance_cursor(ThreadAllocState* state) {
+  state->next_entry_idx++;
+}
 
-  if (entry_idx == SIZE_MAX) {
-    // No oracle entry for this thread/sequence - this is expected for
-    // threads that don't appear in the trace or have exhausted their entries
-    log_trace(gc)("Oracle: No entry for logical thread %d seq %" PRIu64,
-                  logical_thread, per_thread_seq);
-    return false;
-  }
-
-  OracleEntry& entry = _entries[entry_idx];
-
-  // Verify size matches (sanity check)
-  if (entry.size != size) {
-    log_warning(gc)("Oracle: Size mismatch for logical thread %d seq %" PRIu64
-                    ": expected %zu, got %zu (type=%s)",
-                    logical_thread, per_thread_seq, entry.size, size, entry.type);
-    // Continue anyway - size mismatch might be due to alignment differences
-  }
-
-  // Schedule this object for deallocation
-  // The object dies when free_thread (logical) reaches free_seq
+void EpsilonOracle::schedule_death_original(OracleEntry& entry, void* ptr, size_t size) {
+  // Use the original oracle entry's (free_thread, free_seq) directly
+  // Apply global delta if set (delays ALL frees to prevent use-after-free)
   int32_t free_thread = entry.free_thread;
-  uint64_t free_seq = entry.free_seq;
+  uint64_t free_seq = entry.free_seq + EpsilonOracleGlobalDelta;
 
   if (free_seq > 0) {
     MutexLocker ml(_oracle_lock, Mutex::_no_safepoint_check_flag);
@@ -436,17 +431,279 @@ bool EpsilonOracle::register_allocation(int64_t runtime_thread_id, void* ptr, si
     bucket->next = _death_map[bucket_idx];
     _death_map[bucket_idx] = bucket;
   }
+}
 
-  // Update statistics
-  Atomic::add(&_tracked_alloc_counter, (uint64_t)1);
-  Atomic::add(&_allocated_bytes, size);
+void EpsilonOracle::schedule_death_estimated(int32_t alloc_thread, uint64_t estimated_seq, void* ptr, size_t size) {
+  // Schedule death on the allocating thread at estimated sequence
+  // Global delta already included in compute_estimated_death via EpsilonOracleDeathDelta,
+  // but also add global delta for consistency
+  uint64_t final_seq = estimated_seq + EpsilonOracleGlobalDelta;
+  if (final_seq > 0) {
+    MutexLocker ml(_oracle_lock, Mutex::_no_safepoint_check_flag);
 
-  log_info(gc)("Oracle: TRACKED logical_thread=%d seq=%" PRIu64 " type=[%s] size=%zu ptr=" PTR_FORMAT
-               " -> free at logical_thread=%d seq=%" PRIu64,
-               logical_thread, per_thread_seq, entry.type, size, p2i(ptr),
-               free_thread, free_seq);
+    size_t bucket_idx = hash_thread_seq(alloc_thread, final_seq);
+    DeathBucket* bucket = NEW_C_HEAP_OBJ(DeathBucket, mtGC);
+    bucket->logical_thread = alloc_thread;
+    bucket->seq = final_seq;
+    bucket->ptr = ptr;
+    bucket->size = size;
+    bucket->next = _death_map[bucket_idx];
+    _death_map[bucket_idx] = bucket;
+  }
+}
 
-  return true;
+uint64_t EpsilonOracle::compute_estimated_death(uint64_t lifetime, uint64_t current_seq,
+                                                 ThreadAllocState* state) {
+  uint64_t delta = EpsilonOracleDeathDelta;
+  if (lifetime > 0) {
+    return current_seq + lifetime + delta;
+  }
+  // Use average lifetime as fallback
+  return current_seq + state->avg_lifetime + delta;
+}
+
+void EpsilonOracle::push_to_orphan_pool(ThreadAllocState* state, OracleEntry& entry) {
+  // Cap orphan pool size
+  if (state->orphan_count >= MAX_ORPHAN_POOL_SIZE) {
+    // Discard oldest (tail of list) - just drop head for simplicity
+    OrphanEntry* old = state->orphan_pool;
+    if (old != nullptr) {
+      state->orphan_pool = old->next;
+      FREE_C_HEAP_OBJ(old);
+      state->orphan_count--;
+    }
+  }
+
+  OrphanEntry* orphan = NEW_C_HEAP_OBJ(OrphanEntry, mtGC);
+  orphan->size = entry.size;
+  orphan->alloc_seq = entry.alloc_seq;
+  orphan->free_seq = entry.free_seq;
+  orphan->free_thread = entry.free_thread;
+  orphan->alloc_thread = entry.alloc_thread;
+
+  // Compute lifetime: if same thread, use free_seq - alloc_seq; otherwise 0
+  if (entry.free_thread == entry.alloc_thread && entry.free_seq > entry.alloc_seq) {
+    orphan->lifetime = entry.free_seq - entry.alloc_seq;
+  } else {
+    orphan->lifetime = 0;
+  }
+
+  // Insert at head
+  orphan->next = state->orphan_pool;
+  state->orphan_pool = orphan;
+  state->orphan_count++;
+
+  Atomic::add(&_matching_stats.total_skipped, (uint64_t)1);
+}
+
+OrphanEntry* EpsilonOracle::find_in_orphan_pool(ThreadAllocState* state, size_t size) {
+  OrphanEntry* orphan = state->orphan_pool;
+  while (orphan != nullptr) {
+    if (orphan->size == size) {
+      return orphan;
+    }
+    orphan = orphan->next;
+  }
+  return nullptr;
+}
+
+void EpsilonOracle::remove_from_orphan_pool(ThreadAllocState* state, OrphanEntry* orphan, OrphanEntry* prev) {
+  if (prev == nullptr) {
+    state->orphan_pool = orphan->next;
+  } else {
+    prev->next = orphan->next;
+  }
+  state->orphan_count--;
+  FREE_C_HEAP_OBJ(orphan);
+}
+
+void EpsilonOracle::update_lifetime_stats(ThreadAllocState* state, OracleEntry& entry) {
+  // Only count same-thread lifetimes for meaningful average
+  if (entry.free_thread == entry.alloc_thread && entry.free_seq > entry.alloc_seq) {
+    uint64_t lifetime = entry.free_seq - entry.alloc_seq;
+    state->lifetime_sum += lifetime;
+    state->lifetime_count++;
+    state->avg_lifetime = state->lifetime_sum / state->lifetime_count;
+  }
+}
+
+// --- Core allocation registration with resilient matching ---
+
+bool EpsilonOracle::register_allocation(int64_t runtime_thread_id, void* ptr, size_t size) {
+  // Map runtime thread to logical thread
+  int32_t logical_thread = get_logical_thread(runtime_thread_id);
+  if (logical_thread < 0) {
+    log_trace(gc)("Oracle: register_allocation called for unmapped thread %" PRId64, runtime_thread_id);
+    return false;
+  }
+
+  // Get thread state
+  ThreadAllocState* state = get_or_create_thread_state(logical_thread);
+  if (state == nullptr) {
+    return false;
+  }
+  uint64_t per_thread_seq = state->alloc_count;  // Already incremented by caller
+
+  // ============================================================
+  // Step 1: Try cursor entry (perfect sequential match)
+  // ============================================================
+  if (cursor_has_entries(state, logical_thread)) {
+    OracleEntry& entry = cursor_entry(state);
+
+    if (entry.size == size) {
+      // Perfect match - use original death time
+      update_lifetime_stats(state, entry);
+      schedule_death_original(entry, ptr, size);
+      advance_cursor(state);
+
+      Atomic::add(&_matching_stats.perfect_matches, (uint64_t)1);
+      Atomic::add(&_tracked_alloc_counter, (uint64_t)1);
+      Atomic::add(&_allocated_bytes, size);
+
+      log_info(gc)("Oracle: PERFECT logical_thread=%d seq=%" PRIu64 " type=[%s] size=%zu ptr=" PTR_FORMAT
+                   " -> free at logical_thread=%d seq=%" PRIu64,
+                   logical_thread, per_thread_seq, entry.type, size, p2i(ptr),
+                   entry.free_thread, entry.free_seq);
+
+      return true;
+    }
+
+    // Size mismatch at cursor - proceed to lookahead
+    log_debug(gc)("Oracle: Size mismatch at cursor for logical_thread=%d seq=%" PRIu64
+                  ": cursor_size=%zu alloc_size=%zu cursor_type=[%s]",
+                  logical_thread, per_thread_seq, entry.size, size, entry.type);
+  }
+
+  // ============================================================
+  // Step 2: Lookahead scan (cursor+1 .. cursor+K)
+  // ============================================================
+  size_t lookahead = EpsilonOracleLookahead;
+
+  if (lookahead > 0 && cursor_has_entries(state, logical_thread)) {
+    ThreadEntryIndex& idx = _thread_entry_index[logical_thread];
+    size_t end_idx = idx.first_entry_idx + idx.entry_count;
+    size_t scan_start = state->next_entry_idx + 1;
+    size_t scan_end = state->next_entry_idx + 1 + lookahead;
+    if (scan_end > end_idx) scan_end = end_idx;
+
+    for (size_t i = scan_start; i < scan_end; i++) {
+      if (_entries[i].size == size) {
+        // Found a match ahead - push all skipped entries (cursor through i-1) to orphan pool
+        for (size_t j = state->next_entry_idx; j < i; j++) {
+          update_lifetime_stats(state, _entries[j]);
+          push_to_orphan_pool(state, _entries[j]);
+        }
+
+        // Use matched entry's original death time
+        OracleEntry& matched = _entries[i];
+        update_lifetime_stats(state, matched);
+        schedule_death_original(matched, ptr, size);
+
+        // Advance cursor past the matched entry
+        state->next_entry_idx = i + 1;
+
+        Atomic::add(&_matching_stats.lookahead_matches, (uint64_t)1);
+        Atomic::add(&_tracked_alloc_counter, (uint64_t)1);
+        Atomic::add(&_allocated_bytes, size);
+
+        log_info(gc)("Oracle: LOOKAHEAD logical_thread=%d seq=%" PRIu64 " type=[%s] size=%zu ptr=" PTR_FORMAT
+                     " -> free at logical_thread=%d seq=%" PRIu64 " (skipped %zu entries)",
+                     logical_thread, per_thread_seq, matched.type, size, p2i(ptr),
+                     matched.free_thread, matched.free_seq, (i - scan_start + 1));
+
+        return true;
+      }
+    }
+  }
+
+  // ============================================================
+  // Step 3: Check orphan pool (find entry with matching size)
+  // ============================================================
+  {
+    OrphanEntry* prev = nullptr;
+    OrphanEntry* orphan = state->orphan_pool;
+    while (orphan != nullptr) {
+      if (orphan->size == size) {
+        // Found orphan match - use estimated death time
+        uint64_t est_death = compute_estimated_death(orphan->lifetime, per_thread_seq, state);
+        schedule_death_estimated(logical_thread, est_death, ptr, size);
+
+        // Remove from pool
+        remove_from_orphan_pool(state, orphan, prev);
+
+        // Push current cursor entry to orphan pool (if cursor available) and advance
+        if (cursor_has_entries(state, logical_thread)) {
+          OracleEntry& cur = cursor_entry(state);
+          update_lifetime_stats(state, cur);
+          push_to_orphan_pool(state, cur);
+          advance_cursor(state);
+        }
+
+        Atomic::add(&_matching_stats.orphan_matches, (uint64_t)1);
+        Atomic::add(&_tracked_alloc_counter, (uint64_t)1);
+        Atomic::add(&_allocated_bytes, size);
+
+        log_info(gc)("Oracle: ORPHAN logical_thread=%d seq=%" PRIu64 " size=%zu ptr=" PTR_FORMAT
+                     " -> estimated free at logical_thread=%d seq=%" PRIu64,
+                     logical_thread, per_thread_seq, size, p2i(ptr),
+                     logical_thread, est_death);
+
+        return true;
+      }
+      prev = orphan;
+      orphan = orphan->next;
+    }
+  }
+
+  // ============================================================
+  // Step 4: No match found, cursor entry available - use estimated death
+  // ============================================================
+  if (cursor_has_entries(state, logical_thread)) {
+    OracleEntry& entry = cursor_entry(state);
+
+    // Compute lifetime from cursor entry
+    uint64_t lifetime = 0;
+    if (entry.free_thread == entry.alloc_thread && entry.free_seq > entry.alloc_seq) {
+      lifetime = entry.free_seq - entry.alloc_seq;
+    }
+
+    uint64_t est_death = compute_estimated_death(lifetime, per_thread_seq, state);
+    schedule_death_estimated(logical_thread, est_death, ptr, size);
+
+    // Update stats and advance cursor
+    update_lifetime_stats(state, entry);
+    advance_cursor(state);
+
+    Atomic::add(&_matching_stats.estimated_deaths, (uint64_t)1);
+    Atomic::add(&_tracked_alloc_counter, (uint64_t)1);
+    Atomic::add(&_allocated_bytes, size);
+
+    log_info(gc)("Oracle: ESTIMATED logical_thread=%d seq=%" PRIu64 " size=%zu (cursor_size=%zu) ptr=" PTR_FORMAT
+                 " -> estimated free at logical_thread=%d seq=%" PRIu64,
+                 logical_thread, per_thread_seq, size, entry.size, p2i(ptr),
+                 logical_thread, est_death);
+
+    return true;
+  }
+
+  // ============================================================
+  // Step 5: Oracle exhausted for this thread - use avg_lifetime
+  // ============================================================
+  {
+    uint64_t est_death = compute_estimated_death(0, per_thread_seq, state);
+    schedule_death_estimated(logical_thread, est_death, ptr, size);
+
+    Atomic::add(&_matching_stats.oracle_exhausted, (uint64_t)1);
+    Atomic::add(&_tracked_alloc_counter, (uint64_t)1);
+    Atomic::add(&_allocated_bytes, size);
+
+    log_info(gc)("Oracle: EXHAUSTED logical_thread=%d seq=%" PRIu64 " size=%zu ptr=" PTR_FORMAT
+                 " -> estimated free at logical_thread=%d seq=%" PRIu64 " (avg_lifetime=%" PRIu64 ")",
+                 logical_thread, per_thread_seq, size, p2i(ptr),
+                 logical_thread, est_death, state->avg_lifetime);
+
+    return true;
+  }
 }
 
 void EpsilonOracle::process_deaths(int32_t logical_thread, uint64_t per_thread_seq) {
@@ -678,6 +935,22 @@ void EpsilonOracle::print_stats() const {
   log_info(gc)("  Oracle threads:     %d", _num_oracle_threads);
   log_info(gc)("  Runtime threads:    %d", _next_logical_thread_id);
 
+  // Resilient matching statistics
+  log_info(gc)("  Matching statistics:");
+  log_info(gc)("    Perfect matches:  %" PRIu64, _matching_stats.perfect_matches);
+  log_info(gc)("    Lookahead matches:%" PRIu64, _matching_stats.lookahead_matches);
+  log_info(gc)("    Orphan matches:   %" PRIu64, _matching_stats.orphan_matches);
+  log_info(gc)("    Estimated deaths: %" PRIu64, _matching_stats.estimated_deaths);
+  log_info(gc)("    Oracle exhausted: %" PRIu64, _matching_stats.oracle_exhausted);
+  log_info(gc)("    Total skipped:    %" PRIu64, _matching_stats.total_skipped);
+
+  uint64_t total_matched = _matching_stats.perfect_matches + _matching_stats.lookahead_matches +
+                           _matching_stats.orphan_matches + _matching_stats.estimated_deaths +
+                           _matching_stats.oracle_exhausted;
+  if (total_matched > 0) {
+    log_info(gc)("    Perfect rate:     %.1f%%", 100.0 * _matching_stats.perfect_matches / total_matched);
+  }
+
   if (EpsilonOracleMallocMode) {
     log_info(gc)("  Malloc mode:        ENABLED");
     log_info(gc)("  Malloc tracked:     %zu", _malloc_tracked_count);
@@ -692,8 +965,8 @@ void EpsilonOracle::print_stats() const {
   for (size_t i = 0; i < MAX_LOGICAL_THREADS; i++) {
     ThreadAllocState* state = _thread_states[i];
     if (state != nullptr) {
-      log_info(gc)("    Logical thread %d: %" PRIu64 " allocations",
-                   state->logical_thread, state->alloc_count);
+      log_info(gc)("    Logical thread %d: %" PRIu64 " allocations, orphan_pool=%zu, avg_lifetime=%" PRIu64,
+                   state->logical_thread, state->alloc_count, state->orphan_count, state->avg_lifetime);
     }
   }
 }
@@ -754,6 +1027,14 @@ void EpsilonOracle::finalize() {
   log_info(gc)("  Bytes live:         %zu",
                (_allocated_bytes > _freed_bytes) ? (_allocated_bytes - _freed_bytes) : 0);
 
+  // Matching breakdown
+  log_info(gc)("  Matching breakdown:");
+  log_info(gc)("    Perfect:    %" PRIu64, _matching_stats.perfect_matches);
+  log_info(gc)("    Lookahead:  %" PRIu64, _matching_stats.lookahead_matches);
+  log_info(gc)("    Orphan:     %" PRIu64, _matching_stats.orphan_matches);
+  log_info(gc)("    Estimated:  %" PRIu64, _matching_stats.estimated_deaths);
+  log_info(gc)("    Exhausted:  %" PRIu64, _matching_stats.oracle_exhausted);
+
   // Verify all tracked allocations were freed
   if (_tracked_alloc_counter == _free_counter) {
     log_info(gc)("Oracle: SUCCESS - All %" PRIu64 " tracked allocations were freed",
@@ -783,6 +1064,15 @@ void EpsilonOracle::cleanup() {
   for (size_t i = 0; i < MAX_LOGICAL_THREADS; i++) {
     ThreadAllocState* state = _thread_states[i];
     if (state != nullptr) {
+      // Clean up orphan pool for this thread
+      OrphanEntry* orphan = state->orphan_pool;
+      while (orphan != nullptr) {
+        OrphanEntry* next = orphan->next;
+        FREE_C_HEAP_OBJ(orphan);
+        orphan = next;
+      }
+      state->orphan_pool = nullptr;
+
       FREE_C_HEAP_OBJ(state);
       _thread_states[i] = nullptr;
     }
@@ -855,7 +1145,53 @@ extern "C" __attribute__((visibility("default"))) void epsilon_oracle_signal_app
   }
 }
 
-// Set the app allocation pending flag (called before application allocation)
+// Enter app code: increment JVM-side thread-local depth counter
+// Called by OracleSignal agent via libOracleSignal native library
+extern "C" __attribute__((visibility("default"))) void epsilon_oracle_enter_app_code() {
+  Thread* thread = Thread::current();
+  if (thread != nullptr && UseEpsilonGC) {
+    int depth = EpsilonThreadLocalData::app_code_depth(thread) + 1;
+    EpsilonThreadLocalData::set_app_code_depth(thread, depth);
+  }
+}
+
+// Exit app code: decrement JVM-side thread-local depth counter
+extern "C" __attribute__((visibility("default"))) void epsilon_oracle_exit_app_code() {
+  Thread* thread = Thread::current();
+  if (thread != nullptr && UseEpsilonGC) {
+    int depth = EpsilonThreadLocalData::app_code_depth(thread) - 1;
+    if (depth < 0) depth = 0;
+    EpsilonThreadLocalData::set_app_code_depth(thread, depth);
+  }
+}
+
+// Suppress/restore tracking: used during agent overhead (class transformation)
+// to prevent javassist allocations from being counted as app allocations
+extern "C" __attribute__((visibility("default"))) void epsilon_oracle_suppress_tracking(bool suppress) {
+  Thread* thread = Thread::current();
+  if (thread != nullptr && UseEpsilonGC) {
+    EpsilonThreadLocalData::set_tracking_suppressed(thread, suppress);
+  }
+}
+
+// Get current app code depth (for debugging / Java-side queries)
+extern "C" __attribute__((visibility("default"))) int epsilon_oracle_get_app_code_depth() {
+  Thread* thread = Thread::current();
+  if (thread != nullptr && UseEpsilonGC) {
+    return EpsilonThreadLocalData::app_code_depth(thread);
+  }
+  return 0;
+}
+
+// Set the app code depth counter directly (compat API)
+extern "C" __attribute__((visibility("default"))) void epsilon_oracle_set_app_code_depth(int depth) {
+  Thread* thread = Thread::current();
+  if (thread != nullptr && UseEpsilonGC) {
+    EpsilonThreadLocalData::set_app_code_depth(thread, depth);
+  }
+}
+
+// Set the app allocation pending flag (legacy boolean API, kept for compatibility)
 extern "C" __attribute__((visibility("default"))) void epsilon_oracle_set_app_alloc_pending(bool pending) {
   Thread* thread = Thread::current();
   if (thread != nullptr && UseEpsilonGC) {
@@ -867,7 +1203,7 @@ extern "C" __attribute__((visibility("default"))) void epsilon_oracle_set_app_al
 extern "C" __attribute__((visibility("default"))) bool epsilon_oracle_get_app_alloc_pending() {
   Thread* thread = Thread::current();
   if (thread != nullptr && UseEpsilonGC) {
-    return EpsilonThreadLocalData::app_allocation_pending(thread);
+    return EpsilonThreadLocalData::in_app_code(thread);
   }
   return false;
 }

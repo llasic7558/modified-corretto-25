@@ -47,14 +47,7 @@ public class SimpleTestProgram {
         longLived.clear();
         head = null;
 
-        // Print OracleSignal debug counts
-        try {
-            Class<?> osClass = Class.forName("OracleSignal");
-            java.lang.reflect.Method m = osClass.getMethod("printDebugCounts");
-            m.invoke(null);
-        } catch (Exception e) {
-            // Ignore if OracleSignal not available
-        }
+        // OracleSignal debug counts are printed by agent shutdown hook
     }
 
     static Node createLinkedList(int size) {

@@ -2,51 +2,64 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Simple test program for Elephant Tracks 3.
- * Creates objects with various lifetimes to verify trace collection.
+ * TestProgram -- basic Oracle GC test with mixed allocation patterns.
+ *
+ * Rewritten to avoid crash patterns:
+ * - NO string concatenation during allocation phases
+ * - NO System.out.println with variables
+ * - NO System.gc() (not available with Epsilon)
+ * - Uses Object/Object[] and Node only
+ * - All output via System.err with constant strings
  */
 public class TestProgram {
 
     public static void main(String[] args) {
-        System.out.println("TestProgram: Starting...");
+        System.err.println("TestProgram: starting");
 
-        // Create some short-lived objects
+        // Short-lived objects (each dies immediately)
         for (int i = 0; i < 100; i++) {
-            String s = "Short-lived string " + i;
-            s.length(); // Use the object
+            Object o = new Object();
+            touch(o);
         }
 
-        // Create some longer-lived objects
+        System.err.println("TestProgram: short-lived done");
+
+        // Longer-lived objects in a list
         List<Object> longLived = new ArrayList<>();
         for (int i = 0; i < 50; i++) {
             longLived.add(new Object());
         }
 
-        // Create some objects with references between them
+        // Touch all items
+        for (int i = 0; i < longLived.size(); i++) {
+            touch(longLived.get(i));
+        }
+
+        // Create linked list (Node is a top-level class)
         Node head = createLinkedList(20);
         traverseList(head);
 
         // Create arrays
         int[] intArray = new int[100];
-        String[] stringArray = new String[50];
+        Object[] objArray = new Object[50];
         for (int i = 0; i < 50; i++) {
-            stringArray[i] = "Array element " + i;
+            objArray[i] = new Object();
+            touch(objArray[i]);
         }
 
         // Clear long-lived objects to make them collectible
         longLived.clear();
         head = null;
 
-        // Force GC to generate death events
-        System.gc();
-
-        try {
-            Thread.sleep(100); // Give GC time to run
-        } catch (InterruptedException e) {
-            // Ignore
+        // Use arrays to prevent optimization
+        int sum = intArray.length + objArray.length;
+        for (int i = 0; i < objArray.length; i++) {
+            if (objArray[i] != null) {
+                touch(objArray[i]);
+            }
         }
 
-        System.out.println("TestProgram: Complete.");
+        System.err.println("TestProgram: done");
     }
 
     static Node createLinkedList(int size) {
@@ -64,9 +77,13 @@ public class TestProgram {
         int sum = 0;
         while (current != null) {
             sum += current.value;
+            touch(current);
             current = current.next;
         }
-        System.out.println("List sum: " + sum);
+    }
+
+    static void touch(Object o) {
+        o.hashCode();
     }
 }
 

@@ -155,7 +155,8 @@ make images
 |------|-------------|
 | `-XX:+EpsilonOracleMode` | Enable oracle-based memory management |
 | `-XX:EpsilonOracleTracePath=<path>` | Path to oracle CSV file |
-| `-XX:+EpsilonOracleMallocMode` | Use actual malloc/free instead of free-list |
+| `-XX:+EpsilonOracleMallocMode` | Use actual malloc/free (default: true, auto-disables compressed oops) |
+| `-XX:-EpsilonOracleMallocMode` | Use in-heap free-list simulation instead of malloc/free |
 | `-XX:-UseTLAB` | **Required** - disable TLABs to track all allocations |
 
 ### Running with Oracle GC

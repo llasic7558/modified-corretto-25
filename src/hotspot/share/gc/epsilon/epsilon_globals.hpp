@@ -99,20 +99,33 @@
           "Validate allocation sizes against oracle trace (slower)")        \
                                                                             \
   product(uint64_t, EpsilonOracleSkipAllocs, 0, EXPERIMENTAL,               \
-          "Number of allocations to skip before starting oracle tracking. " \
-          "Use this to skip VM bootstrap allocations when the trace only "  \
-          "contains application-level allocations.")                        \
+          "Number of initial allocations to skip before starting oracle "   \
+          "tracking. Use this to skip JVM bootstrap allocations. "          \
+          "A value of 0 means tracking starts immediately.")                \
           range(0, max_julong)                                              \
                                                                             \
-  product(uint64_t, EpsilonOracleGracePeriod, 0, EXPERIMENTAL,              \
-          "Number of additional allocations to delay before freeing. "      \
-          "Use this to compensate for incomplete liveness traces. "         \
-          "A value of N means objects are freed N allocations later "       \
-          "than the trace specifies.")                                      \
+  product(size_t, EpsilonOracleLookahead, 16, EXPERIMENTAL,                 \
+          "Number of oracle entries to scan ahead on size mismatch. "       \
+          "Higher values tolerate more allocation sequence divergence "     \
+          "between trace and replay JVMs. 0 disables lookahead.")           \
+          range(0, 1024)                                                    \
+                                                                            \
+  product(uint64_t, EpsilonOracleDeathDelta, 100, EXPERIMENTAL,            \
+          "Safety margin added to estimated death times for orphan/pool "   \
+          "matched allocations. Prevents premature frees when allocation "  \
+          "sequences diverge. Higher values are safer but delay frees.")    \
           range(0, max_julong)                                              \
                                                                             \
-  product(bool, EpsilonOracleMallocMode, false, EXPERIMENTAL,               \
+  product(uint64_t, EpsilonOracleGlobalDelta, 0, EXPERIMENTAL,             \
+          "Global safety margin added to ALL death times (including "       \
+          "perfect and lookahead matches). Delays every free by this "      \
+          "many allocations. Use to prevent use-after-free in liveness "    \
+          "mode when trace/replay diverge slightly. 0 = disabled.")         \
+          range(0, max_julong)                                              \
+                                                                            \
+  product(bool, EpsilonOracleMallocMode, true, EXPERIMENTAL,                \
           "Use actual malloc/free instead of simulated free list. "         \
+          "Enabled by default in oracle mode. "                            \
           "Requires -XX:-UseCompressedOops -XX:-UseCompressedClassPointers")
 
 // end of GC_EPSILON_FLAGS

@@ -77,15 +77,17 @@ void EpsilonArguments::initialize() {
 
     log_info(gc)("Oracle mode enabled with trace: %s", EpsilonOracleTracePath);
 
-    // Oracle malloc mode validation
+    // Oracle malloc mode: auto-disable compressed oops/class pointers
+    // Malloc'd addresses are outside the heap region and cannot be encoded
+    // as compressed oops (32-bit offsets from heap base)
     if (EpsilonOracleMallocMode) {
       if (UseCompressedOops) {
-        vm_exit_during_initialization(
-          "EpsilonOracleMallocMode requires -XX:-UseCompressedOops");
+        log_info(gc)("Oracle malloc mode: auto-disabling UseCompressedOops");
+        FLAG_SET_CMDLINE(UseCompressedOops, false);
       }
       if (UseCompressedClassPointers) {
-        vm_exit_during_initialization(
-          "EpsilonOracleMallocMode requires -XX:-UseCompressedClassPointers");
+        log_info(gc)("Oracle malloc mode: auto-disabling UseCompressedClassPointers");
+        FLAG_SET_CMDLINE(UseCompressedClassPointers, false);
       }
       log_info(gc)("Oracle MALLOC mode: using actual malloc/free");
     }
