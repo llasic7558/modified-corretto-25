@@ -36,17 +36,13 @@ private:
   size_t _ergo_tlab_size;
   int64_t _last_tlab_time;
   Klass* _current_alloc_klass;  // For oracle mode: Klass being allocated
-  bool _app_allocation_pending;    // For oracle mode: legacy boolean API
-  int _app_code_depth;             // For oracle mode: depth counter (preferred API)
-  bool _tracking_suppressed;       // For oracle mode: suppress tracking during agent overhead
+  int _app_code_depth;             // For oracle mode: depth counter set by InterpreterRuntime
 
   EpsilonThreadLocalData() :
           _ergo_tlab_size(0),
           _last_tlab_time(0),
           _current_alloc_klass(nullptr),
-          _app_allocation_pending(false),
-          _app_code_depth(0),
-          _tracking_suppressed(false) {}
+          _app_code_depth(0) {}
 
   static EpsilonThreadLocalData* data(Thread* thread) {
     assert(UseEpsilonGC, "Sanity");
@@ -87,40 +83,20 @@ public:
     data(thread)->_current_alloc_klass = klass;
   }
 
-  // Oracle mode: application allocation pending flag (legacy boolean API)
-  static bool app_allocation_pending(Thread* thread) {
-    return data(thread)->_app_allocation_pending;
-  }
-
-  static void set_app_allocation_pending(Thread* thread, bool pending) {
-    data(thread)->_app_allocation_pending = pending;
-  }
-
-  // Oracle mode: app code depth counter (preferred API)
-  // When depth > 0, allocations are from application code
+  // Oracle mode: app code depth counter
+  // Set to 1 by InterpreterRuntime before app allocations, reset to 0 after.
+  // When depth > 0, the allocation is from application code and should be tracked.
   static int app_code_depth(Thread* thread) {
     return data(thread)->_app_code_depth;
   }
 
   static void set_app_code_depth(Thread* thread, int depth) {
     data(thread)->_app_code_depth = depth;
-    // Keep legacy boolean in sync
-    data(thread)->_app_allocation_pending = (depth > 0);
   }
 
-  // Oracle mode: suppress tracking during agent overhead (class transformation)
-  static bool tracking_suppressed(Thread* thread) {
-    return data(thread)->_tracking_suppressed;
-  }
-
-  static void set_tracking_suppressed(Thread* thread, bool suppressed) {
-    data(thread)->_tracking_suppressed = suppressed;
-  }
-
-  // Check if currently in application code and tracking is not suppressed
+  // Check if currently in application code (depth > 0)
   static bool in_app_code(Thread* thread) {
-    if (data(thread)->_tracking_suppressed) return false;
-    return data(thread)->_app_code_depth > 0 || data(thread)->_app_allocation_pending;
+    return data(thread)->_app_code_depth > 0;
   }
 };
 

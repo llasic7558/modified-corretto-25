@@ -22,6 +22,7 @@
  *
  */
 
+#include "classfile/classLoaderData.inline.hpp"
 #include "classfile/javaClasses.inline.hpp"
 #include "classfile/symbolTable.hpp"
 #include "classfile/vmClasses.hpp"
@@ -40,6 +41,7 @@
 #include "jvm_io.h"
 #include "logging/log.hpp"
 #include "memory/oopFactory.hpp"
+#include "runtime/atomic.hpp"
 #include "memory/resourceArea.hpp"
 #include "memory/universe.hpp"
 #include "oops/constantPool.inline.hpp"
@@ -75,6 +77,8 @@
 #include "utilities/checkedCast.hpp"
 #include "utilities/copy.hpp"
 #include "utilities/events.hpp"
+#include "gc/epsilon/epsilonThreadLocalData.hpp"
+#include "gc/epsilon/epsilon_globals.hpp"
 #if INCLUDE_JFR
 #include "jfr/jfr.inline.hpp"
 #endif
@@ -209,6 +213,95 @@ JRT_END
 
 
 //------------------------------------------------------------------------------------------------------------------------
+// Oracle GC: JVM-internal allocation detection
+//
+// Check if current allocation site should be tracked by Oracle GC.
+// Matches ET's allocation tracking: non-bootstrap class, non-skipped method.
+// This replaces the external OracleSignalAgent — no bytecode rewriting needed.
+// Diagnostic counters for oracle allocation filtering
+static volatile int _oracle_skip_boot = 0;
+static volatile int _oracle_skip_init = 0;
+static volatile int _oracle_skip_clinit = 0;
+static volatile int _oracle_skip_method = 0;
+static volatile int _oracle_skip_lambda = 0;
+static volatile int _oracle_skip_access = 0;
+static volatile int _oracle_tracked = 0;
+static volatile int _oracle_total_calls = 0;
+// Per-thread first-rejection logging: track which threads we've logged
+static volatile int _oracle_logged_thread_count = 0;
+
+static bool oracle_should_track_allocation(JavaThread* current, ConstantPool* pool, Klass* alloc_klass = nullptr) {
+  if (!UseEpsilonGC || !EpsilonOracleMode) return false;
+
+  Atomic::inc(&_oracle_total_calls);
+
+  // Check allocation site is in non-bootstrap class (matches ET's class filtering)
+  InstanceKlass* pool_holder = pool->pool_holder();
+  if (pool_holder->class_loader_data()->is_boot_class_loader_data()) {
+    Atomic::inc(&_oracle_skip_boot);
+    // Log first 10 boot-class rejections for diagnosis
+    int boot_count = _oracle_skip_boot;
+    if (boot_count <= 10 && EpsilonOracleVerboseTracking) {
+      LastFrameAccessor last_frame2(current);
+      Method* method2 = last_frame2.method();
+      const char* alloc_type2 = (alloc_klass != nullptr) ? alloc_klass->external_name() : "<unknown>";
+      log_info(gc)("Oracle SKIP_BOOT: class=%s method=%s alloc_type=%s",
+                   pool_holder->external_name(),
+                   method2->name()->as_C_string(),
+                   alloc_type2);
+    }
+    return false;
+  }
+
+  // Check method is not in ET's skip list (MethodInstrumenter.shouldIgnoreMethod())
+  LastFrameAccessor last_frame(current);
+  Method* method = last_frame.method();
+  Symbol* name = method->name();
+
+  if (name == vmSymbols::object_initializer_name()) { Atomic::inc(&_oracle_skip_init); return false; }
+  if (name == vmSymbols::class_initializer_name()) { Atomic::inc(&_oracle_skip_clinit); return false; }
+  if (name == vmSymbols::equals_name() ||
+      name == vmSymbols::toString_name() ||
+      name == vmSymbols::finalize_method_name() ||
+      name->equals("hashCode") ||
+      name->equals("wait") ||
+      name->equals("notify") ||
+      name->equals("notifyAll")) {
+    Atomic::inc(&_oracle_skip_method);
+    return false;
+  }
+  if (name->starts_with("lambda$")) { Atomic::inc(&_oracle_skip_lambda); return false; }
+  if (name->starts_with("access$")) { Atomic::inc(&_oracle_skip_access); return false; }
+
+  Atomic::inc(&_oracle_tracked);
+
+  if (EpsilonOracleVerboseTracking) {
+    const char* alloc_type = (alloc_klass != nullptr) ? alloc_klass->external_name() : "<unknown>";
+    log_info(gc)("Oracle TRACK: thread=" PTR_FORMAT " class=%s method=%s alloc_type=%s",
+                 p2i(current),
+                 pool_holder->external_name(),
+                 name->as_C_string(),
+                 alloc_type);
+  }
+
+  return true;
+}
+
+// Called at JVM shutdown to print oracle filter diagnostics
+void oracle_print_filter_stats() {
+  if (!UseEpsilonGC || !EpsilonOracleMode) return;
+  log_info(gc)("Oracle filter stats:");
+  log_info(gc)("  Total calls:    %d", _oracle_total_calls);
+  log_info(gc)("  Tracked:        %d", _oracle_tracked);
+  log_info(gc)("  Skip boot:      %d", _oracle_skip_boot);
+  log_info(gc)("  Skip <init>:    %d", _oracle_skip_init);
+  log_info(gc)("  Skip <clinit>:  %d", _oracle_skip_clinit);
+  log_info(gc)("  Skip method:    %d", _oracle_skip_method);
+  log_info(gc)("  Skip lambda$:   %d", _oracle_skip_lambda);
+  log_info(gc)("  Skip access$:   %d", _oracle_skip_access);
+}
+
+//------------------------------------------------------------------------------------------------------------------------
 // Allocation
 
 JRT_ENTRY(void, InterpreterRuntime::_new(JavaThread* current, ConstantPool* pool, int index))
@@ -221,20 +314,62 @@ JRT_ENTRY(void, InterpreterRuntime::_new(JavaThread* current, ConstantPool* pool
   // Make sure klass is initialized
   klass->initialize(CHECK);
 
+  // Oracle GC: detect app allocation AFTER class resolution/init, BEFORE allocation
+  bool oracle_track = oracle_should_track_allocation(current, pool, klass);
+  if (oracle_track) {
+    EpsilonThreadLocalData::set_app_code_depth(current, 1);
+  }
+
   oop obj = klass->allocate_instance(CHECK);
+
+  if (oracle_track) {
+    EpsilonThreadLocalData::set_app_code_depth(current, 0);
+  }
+
   current->set_vm_result_oop(obj);
 JRT_END
 
 
 JRT_ENTRY(void, InterpreterRuntime::newarray(JavaThread* current, BasicType type, jint size))
+  // Oracle GC: check allocation site via current method's constant pool.
+  // Resolve the TypeArrayKlass so oracle_should_track_allocation can log the
+  // allocated type for verbose tracking, improving diagnostic output for
+  // primitive array allocations (byte[], int[], etc.).
+  bool oracle_track = false;
+  if (UseEpsilonGC && EpsilonOracleMode) {
+    LastFrameAccessor last_frame(current);
+    ConstantPool* pool = last_frame.method()->constants();
+    Klass* alloc_klass = Universe::typeArrayKlass(type);
+    oracle_track = oracle_should_track_allocation(current, pool, alloc_klass);
+    if (oracle_track) {
+      EpsilonThreadLocalData::set_app_code_depth(current, 1);
+    }
+  }
+
   oop obj = oopFactory::new_typeArray(type, size, CHECK);
+
+  if (oracle_track) {
+    EpsilonThreadLocalData::set_app_code_depth(current, 0);
+  }
+
   current->set_vm_result_oop(obj);
 JRT_END
 
 
 JRT_ENTRY(void, InterpreterRuntime::anewarray(JavaThread* current, ConstantPool* pool, int index, jint size))
-  Klass*    klass = pool->klass_at(index, CHECK);
+  Klass* klass = pool->klass_at(index, CHECK);
+
+  bool oracle_track = oracle_should_track_allocation(current, pool, klass);
+  if (oracle_track) {
+    EpsilonThreadLocalData::set_app_code_depth(current, 1);
+  }
+
   objArrayOop obj = oopFactory::new_objArray(klass, size, CHECK);
+
+  if (oracle_track) {
+    EpsilonThreadLocalData::set_app_code_depth(current, 0);
+  }
+
   current->set_vm_result_oop(obj);
 JRT_END
 
@@ -248,6 +383,11 @@ JRT_ENTRY(void, InterpreterRuntime::multianewarray(JavaThread* current, jint* fi
   int   nof_dims = last_frame.number_of_dimensions();
   assert(klass->is_klass(), "not a class");
   assert(nof_dims >= 1, "multianewarray rank must be nonzero");
+
+  bool oracle_track = oracle_should_track_allocation(current, constants, klass);
+  if (oracle_track) {
+    EpsilonThreadLocalData::set_app_code_depth(current, 1);
+  }
 
   // We must create an array of jints to pass to multi_allocate.
   ResourceMark rm(current);
@@ -263,6 +403,11 @@ JRT_ENTRY(void, InterpreterRuntime::multianewarray(JavaThread* current, jint* fi
     dims[index] = first_size_address[n];
   }
   oop obj = ArrayKlass::cast(klass)->multi_allocate(nof_dims, dims, CHECK);
+
+  if (oracle_track) {
+    EpsilonThreadLocalData::set_app_code_depth(current, 0);
+  }
+
   current->set_vm_result_oop(obj);
 JRT_END
 

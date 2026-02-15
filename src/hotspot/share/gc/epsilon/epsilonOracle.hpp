@@ -32,6 +32,7 @@
 
 // Oracle entry from the trace file (per-thread format with LOGICAL thread IDs)
 // Format: alloc_thread,alloc_seq,free_thread,free_seq,size,type,obj_id
+// (Also supports 9-column format with type_hash and relative_lifetime columns)
 // Thread IDs are LOGICAL (0, 1, 2, ...) based on order of first allocation in trace.
 // At runtime, OS thread IDs are mapped to logical IDs in the same order.
 struct OracleEntry {
@@ -41,6 +42,13 @@ struct OracleEntry {
   uint64_t free_seq;       // Per-thread sequence at which to free
   size_t   size;           // Object size in bytes
   char     type[128];      // Object type name (for debugging only, not used for matching)
+};
+
+// Delayed-free entry for the delayed-free circular buffer
+struct DelayedFreeEntry {
+  void*    ptr;                   // Pointer to free
+  size_t   size;                  // Size in bytes
+  uint64_t freed_at_global_seq;   // _total_alloc_counter when logically freed
 };
 
 // Death bucket for the death map (linked list node)
@@ -86,14 +94,34 @@ struct OrphanEntry {
   OrphanEntry* next;       // Next in linked list
 };
 
+// Type queue node: points to an oracle entry in a per-thread type FIFO
+struct TypeQueueNode {
+  size_t entry_idx;        // Index into _entries array
+  TypeQueueNode* next;     // Next in FIFO
+};
+
+// Type queue: FIFO of oracle entries with the same (thread, type) key
+struct TypeQueue {
+  TypeQueueNode* head;     // Dequeue from head
+  TypeQueueNode* tail;     // Enqueue at tail
+  size_t count;            // Number of entries
+  char type_name[128];     // Type name key (normalized)
+  TypeQueue* next;         // Next in hash chain
+};
+
 // Statistics for resilient oracle matching
 struct OracleMatchingStats {
+  volatile uint64_t thread0_skipped;     // Thread 0 allocations skipped
   volatile uint64_t perfect_matches;     // Cursor entry matched size exactly
   volatile uint64_t lookahead_matches;   // Found match by scanning ahead
   volatile uint64_t orphan_matches;      // Found match in orphan pool
   volatile uint64_t estimated_deaths;    // Used cursor entry's lifetime as fallback
   volatile uint64_t oracle_exhausted;    // Oracle ran out for thread
   volatile uint64_t total_skipped;       // Entries pushed to orphan pool
+  volatile uint64_t type_matches;        // Matched via type queue FIFO
+  volatile uint64_t type_exhausted;      // Type queue empty (leak safely)
+  volatile uint64_t type_size_mismatch;  // Type matched but size mismatch (leak safely)
+  volatile uint64_t type_fallback;       // Type not available, fell back to size matching
 };
 
 // Per-thread allocation state (keyed by LOGICAL thread ID)
@@ -111,6 +139,10 @@ struct ThreadAllocState {
   uint64_t avg_lifetime;      // Running average lifetime
   uint64_t lifetime_sum;      // Sum for computing average
   uint64_t lifetime_count;    // Count for computing average
+
+  // Type-keyed FIFO queues: hash table of type name -> FIFO of oracle entries
+  static const size_t TYPE_QUEUE_BUCKETS = 256;
+  TypeQueue* type_queues[TYPE_QUEUE_BUCKETS];
 };
 
 // Oracle-based memory manager for deterministic malloc/free
@@ -189,8 +221,23 @@ private:
   // Maximum orphan pool entries per thread
   static const size_t MAX_ORPHAN_POOL_SIZE = 1024;
 
+  // Double-finalize guard
+  bool _finalized;
+
   // Mutex for thread-safe access to thread map and death map
   Mutex* _oracle_lock;
+
+  // Delayed-free circular buffer (for EpsilonOracleFreeDelay > 0)
+  static const size_t DELAYED_FREE_CAPACITY = 1 << 16;  // 64K entries
+  DelayedFreeEntry* _delayed_free_buf;
+  size_t _delayed_free_head;   // Next entry to drain (oldest)
+  size_t _delayed_free_tail;   // Next entry to write
+  size_t _delayed_free_count;  // Current entries in buffer
+
+  // Delayed free helpers (called under _oracle_lock)
+  void delayed_free(void* ptr, size_t size);
+  void drain_delayed_frees();
+  void drain_all_delayed_frees();
 
   // Hash function for death map: combines logical_thread_id and seq
   size_t hash_thread_seq(int32_t logical_thread, uint64_t seq) const {
@@ -216,6 +263,12 @@ private:
   // Build thread entry index after loading trace
   void build_thread_entry_index();
 
+  // Build type-keyed FIFO queues for each (thread, type) pair
+  void build_type_queues();
+
+  // Hash a type name to a bucket index
+  static size_t hash_type_name(const char* type_name);
+
   // Get or create thread allocation state for a logical thread
   ThreadAllocState* get_or_create_thread_state(int32_t logical_thread);
 
@@ -230,6 +283,14 @@ private:
 
   // Schedule death using estimated sequence on the allocating thread
   void schedule_death_estimated(int32_t alloc_thread, uint64_t estimated_seq, void* ptr, size_t size);
+
+  // Schedule death using RELATIVE lifetime from oracle entry.
+  // Computes lifetime = free_seq - alloc_seq and schedules at
+  // replay_alloc_seq + lifetime on the replay (allocating) thread.
+  // This handles allocation sequence divergence between trace and replay
+  // for both same-thread and cross-thread frees.
+  void schedule_death_relative(OracleEntry& entry, void* ptr, size_t size,
+                               int32_t replay_logical_thread, uint64_t replay_alloc_seq);
 
   // Compute estimated death time from an orphan entry or oracle entry
   uint64_t compute_estimated_death(uint64_t lifetime, uint64_t current_seq,
@@ -257,7 +318,9 @@ public:
   ~EpsilonOracle();
 
   // Load oracle trace from CSV file
-  // New format: alloc_thread,alloc_seq,free_thread,free_seq,size,type,obj_id
+  // Supports both 7-column and 9-column formats:
+  //   7-col: alloc_thread,alloc_seq,free_thread,free_seq,size,type,obj_id
+  //   9-col: alloc_thread,alloc_seq,free_thread,free_seq,size,type,type_hash,relative_lifetime,obj_id
   bool load_trace(const char* path);
 
   // Register an allocation for a specific thread (takes runtime OS thread ID)
@@ -265,7 +328,8 @@ public:
   // runtime_thread_id: OS thread ID of allocating thread (will be mapped to logical)
   // ptr: allocated memory
   // size: size in bytes
-  bool register_allocation(int64_t runtime_thread_id, void* ptr, size_t size);
+  // alloc_type: normalized type name (for type-keyed matching), or nullptr for size-based fallback
+  bool register_allocation(int64_t runtime_thread_id, void* ptr, size_t size, const char* alloc_type = nullptr);
 
   // Process all deaths for a specific logical thread at given per-thread sequence
   // Adds freed memory to free list
@@ -291,7 +355,8 @@ public:
   bool untrack_malloc_ptr(void* ptr, size_t* out_size);
 
   // Check if a pointer is tracked in the malloc pointer map
-  bool is_malloc_tracked(void* ptr) const;
+  // Note: acquires _oracle_lock internally for thread safety
+  bool is_malloc_tracked(void* ptr);
 
   // Free list allocator methods
   HeapWord* allocate_from_free_list(size_t size);
@@ -312,6 +377,10 @@ public:
   uint64_t free_count() const { return _free_counter; }
   size_t allocated_bytes() const { return _allocated_bytes; }
   size_t freed_bytes() const { return _freed_bytes; }
+
+  // Normalize a JVM internal type name to Java format matching oracle CSV
+  // e.g., "[B" -> "byte[]", "[Ljava.lang.String;" -> "java.lang.String[]"
+  static void normalize_type_name(const char* raw, char* out, size_t out_len);
 
   // Print statistics
   void print_stats() const;

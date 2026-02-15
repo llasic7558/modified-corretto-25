@@ -158,20 +158,21 @@ make images
 | `-XX:+EpsilonOracleMallocMode` | Use actual malloc/free (default: true, auto-disables compressed oops) |
 | `-XX:-EpsilonOracleMallocMode` | Use in-heap free-list simulation instead of malloc/free |
 | `-XX:-UseTLAB` | **Required** - disable TLABs to track all allocations |
+| `-Xint` | **Required** - interpreter only, ensures all allocations go through InterpreterRuntime |
+| `-XX:+EpsilonOracleVerboseTracking` | Log each tracked allocation with method/type info |
 
 ### Running with Oracle GC
 
 ```bash
-# Requires Oracle Signal Agent for application allocation filtering
+# InterpreterRuntime automatically detects app allocations (no external agent needed)
 ./build/*/images/jdk/bin/java \
     -XX:+UnlockExperimentalVMOptions \
     -XX:+UseEpsilonGC \
     -XX:-UseTLAB \
+    -Xint \
     -XX:+EpsilonOracleMode \
     -XX:EpsilonOracleTracePath=oracle.csv \
-    -Djava.library.path=/path/to/oracle-signal-agent \
-    --enable-native-access=ALL-UNNAMED \
-    -javaagent:/path/to/oracle-signal-agent.jar \
+    -Xlog:gc=info \
     -cp myapp.jar MyApp
 ```
 
@@ -195,11 +196,11 @@ alloc_thread,alloc_seq,free_thread,free_seq,size,type,obj_id
 ### Key Implementation Details
 
 1. **Thread ID Remapping**: Runtime OS thread IDs are mapped to logical IDs (0, 1, 2, ...) based on first allocation order
-2. **Application Allocation Filtering**: JVMTI agent signals application allocations to distinguish from JVM internals
+2. **Application Allocation Filtering**: InterpreterRuntime detects app allocations by checking the allocating method's class loader and name against a skip list (matching ET's filtering)
 3. **Death Scheduling**: Objects freed when specified thread reaches specified allocation sequence number
 
 ### Related Projects
 
-- **Oracle Signal Agent** (`../oracle-signal-agent/`): JVMTI agent for filtering application allocations
 - **Oracle Generator** (`../oracle_generator.py`): Converts Elephant Tracks traces to oracle format
 - **Elephant Tracks** (`../elephant-tracks/`): JVMTI agent for trace collection
+- **Oracle Signal Agent** (`../oracle-signal-agent/`): Legacy bytecode instrumentation agent (no longer required)

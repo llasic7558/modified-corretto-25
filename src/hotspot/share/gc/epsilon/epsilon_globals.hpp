@@ -126,7 +126,25 @@
   product(bool, EpsilonOracleMallocMode, true, EXPERIMENTAL,                \
           "Use actual malloc/free instead of simulated free list. "         \
           "Enabled by default in oracle mode. "                            \
-          "Requires -XX:-UseCompressedOops -XX:-UseCompressedClassPointers")
+          "Requires -XX:-UseCompressedOops -XX:-UseCompressedClassPointers")\
+                                                                            \
+  product(bool, EpsilonOracleSkipThread0, true, EXPERIMENTAL,               \
+          "Skip oracle thread 0 during replay. Thread 0 in the oracle "    \
+          "is the main/init thread traced with ET overhead. When true, "   \
+          "runtime threads map starting from logical thread 1. When "      \
+          "false, the first runtime thread maps to logical thread 0.")     \
+                                                                            \
+  product(uint64_t, EpsilonOracleFreeDelay, 0, EXPERIMENTAL,               \
+          "Number of global allocations to delay before actually freeing " \
+          "memory in malloc mode. Prevents use-after-free from slight "    \
+          "allocation sequence divergence between trace and replay. "      \
+          "0 means immediate free (no delay).")                            \
+          range(0, max_julong)                                              \
+                                                                            \
+  product(bool, EpsilonOracleVerboseTracking, false, EXPERIMENTAL,          \
+          "Log each tracked application allocation with thread ID, "        \
+          "method class, method name, and allocated type. Useful for "      \
+          "verifying trace-side and replay-side filter agreement.")
 
 // end of GC_EPSILON_FLAGS
 

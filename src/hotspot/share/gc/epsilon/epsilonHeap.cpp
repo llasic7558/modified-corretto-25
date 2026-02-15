@@ -227,9 +227,16 @@ HeapWord* EpsilonHeap::allocate_work(size_t size, bool verbose) {
   return res;
 }
 
+volatile uint64_t _total_oracle_alloc_calls = 0;
+volatile uint64_t _total_oracle_alloc_pre_app = 0;
+volatile uint64_t _total_oracle_alloc_system = 0;
+volatile uint64_t _total_oracle_alloc_tracked = 0;
+
 HeapWord* EpsilonHeap::allocate_work_oracle(size_t size, bool verbose) {
   assert(EpsilonOracleMode, "Should only be called in oracle mode");
   assert(_oracle != nullptr, "Oracle should be initialized");
+
+  Atomic::inc(&_total_oracle_alloc_calls);
 
   // Get OS thread ID for per-thread tracking
   int64_t thread_id = os::current_thread_id();
@@ -260,6 +267,7 @@ HeapWord* EpsilonHeap::allocate_work_oracle(size_t size, bool verbose) {
   // Before app starts, use bump-pointer allocation without tracking
   // (JVM bootstrap allocations are not in the trace)
   if (!_oracle->app_started()) {
+    Atomic::inc(&_total_oracle_alloc_pre_app);
     _oracle->count_pre_app_alloc();
 
     // Auto-start after EpsilonOracleSkipAllocs allocations
@@ -279,15 +287,17 @@ HeapWord* EpsilonHeap::allocate_work_oracle(size_t size, bool verbose) {
 
   // Application has started - use per-thread sequential matching
   // The N-th allocation on thread T matches the N-th oracle entry for thread T
-  // But ONLY for application allocations (signaled by JVMTI agent)
+  // ONLY for application allocations (detected via JVM-internal classloader check
+  // in InterpreterRuntime::_new/newarray/anewarray/multianewarray)
 
-  // Check if this is an application allocation (signaled by OracleSignal agent)
-  // Uses depth counter (preferred) or legacy boolean flag
+  // Check if this is an application allocation
+  // JVM-internal detection sets app_code_depth=1 around app allocations in interpreter
   Thread* current_thread = Thread::current();
   bool is_app_allocation = EpsilonThreadLocalData::in_app_code(current_thread);
 
   // If not an application allocation, just do bump-pointer allocation without tracking
   if (!is_app_allocation) {
+    Atomic::inc(&_total_oracle_alloc_system);
     HeapWord* mem = bump_allocate();
     if (verbose && mem != nullptr) {
       log_trace(gc)("Oracle SYSTEM alloc (not tracked): thread=%" PRId64 " ptr=" PTR_FORMAT
@@ -297,7 +307,9 @@ HeapWord* EpsilonHeap::allocate_work_oracle(size_t size, bool verbose) {
     return mem;
   }
 
-  // This is an application allocation (signaled by agent) - track it with the oracle
+  Atomic::inc(&_total_oracle_alloc_tracked);
+
+  // This is an application allocation - track it with the oracle
   // Get next per-thread allocation sequence number (1-based)
   // This also maps the runtime thread to a logical thread ID
   uint64_t per_thread_seq = _oracle->next_thread_alloc_seq(thread_id);
@@ -309,6 +321,16 @@ HeapWord* EpsilonHeap::allocate_work_oracle(size_t size, bool verbose) {
     log_trace(gc)("Oracle: Thread %" PRId64 " not mapped to logical thread", thread_id);
     HeapWord* mem = bump_allocate();
     return mem;
+  }
+
+  // Get the type name for type-keyed matching
+  const char* alloc_type = nullptr;
+  char normalized_type[128];
+  Klass* klass = EpsilonThreadLocalData::current_alloc_klass(current_thread);
+  if (klass != nullptr) {
+    const char* raw_name = klass->external_name();
+    EpsilonOracle::normalize_type_name(raw_name, normalized_type, sizeof(normalized_type));
+    alloc_type = normalized_type;
   }
 
   HeapWord* mem = nullptr;
@@ -334,15 +356,16 @@ HeapWord* EpsilonHeap::allocate_work_oracle(size_t size, bool verbose) {
     _oracle->track_malloc_ptr(malloc_mem, size_in_bytes);
 
     // Register for future deallocation (returns true if matched oracle entry)
-    bool matched = _oracle->register_allocation(thread_id, malloc_mem, size_in_bytes);
+    bool matched = _oracle->register_allocation(thread_id, malloc_mem, size_in_bytes, alloc_type);
 
     // Track allocated bytes
     Atomic::add(&_oracle_allocated_bytes, size_in_bytes);
 
     if (verbose) {
       log_info(gc)("Oracle MALLOC alloc: thread=" INT64_FORMAT " seq=" UINT64_FORMAT " ptr=" PTR_FORMAT
-                   " size=%zu bytes matched=%s",
-                   thread_id, per_thread_seq, p2i(malloc_mem), size_in_bytes, matched ? "true" : "false");
+                   " size=%zu bytes type=[%s] matched=%s",
+                   thread_id, per_thread_seq, p2i(malloc_mem), size_in_bytes,
+                   (alloc_type ? alloc_type : "?"), matched ? "true" : "false");
     }
 
     return (HeapWord*)malloc_mem;
@@ -373,15 +396,16 @@ HeapWord* EpsilonHeap::allocate_work_oracle(size_t size, bool verbose) {
   memset(mem, 0, size_in_bytes);
 
   // Register this allocation with the oracle for future deallocation
-  bool matched = _oracle->register_allocation(thread_id, mem, size_in_bytes);
+  bool matched = _oracle->register_allocation(thread_id, mem, size_in_bytes, alloc_type);
 
   // Track allocated bytes
   Atomic::add(&_oracle_allocated_bytes, size_in_bytes);
 
   if (verbose) {
     log_info(gc)("Oracle alloc: thread=" INT64_FORMAT " seq=" UINT64_FORMAT " ptr=" PTR_FORMAT
-                 " size=%zu bytes matched=%s",
-                 thread_id, per_thread_seq, p2i(mem), size_in_bytes, matched ? "true" : "false");
+                 " size=%zu bytes type=[%s] matched=%s",
+                 thread_id, per_thread_seq, p2i(mem), size_in_bytes,
+                 (alloc_type ? alloc_type : "?"), matched ? "true" : "false");
   }
 
   return mem;

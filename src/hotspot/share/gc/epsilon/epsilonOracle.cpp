@@ -39,13 +39,116 @@
 #include <cstdio>
 #include <cstring>
 
+// --- Type name normalization ---
+
+// Normalize JVM internal type names to Java format matching oracle CSV.
+// JVM external_name() returns:
+//   "byte[]" for [B, "int[]" for [I, etc. (already correct for primitives)
+//   "java.lang.String[]" for [Ljava.lang.String; (already correct)
+// But the oracle CSV may use slightly different formats, so we normalize both sides.
+//
+// This function handles:
+//   "[B" -> "byte[]", "[I" -> "int[]", etc. (JVM internal descriptor format)
+//   "byte[]" -> "byte[]" (pass-through, already normalized)
+//   Any other format passes through unchanged
+void EpsilonOracle::normalize_type_name(const char* raw, char* out, size_t out_len) {
+  if (raw == nullptr || out_len == 0) {
+    if (out_len > 0) out[0] = '\0';
+    return;
+  }
+
+  // Handle JVM internal descriptor format (starts with '[')
+  if (raw[0] == '[') {
+    // Count array dimensions
+    int dims = 0;
+    const char* p = raw;
+    while (*p == '[') {
+      dims++;
+      p++;
+    }
+
+    // Decode element type
+    const char* elem_type = nullptr;
+    char class_buf[256];
+
+    switch (*p) {
+      case 'B': elem_type = "byte"; break;
+      case 'C': elem_type = "char"; break;
+      case 'D': elem_type = "double"; break;
+      case 'F': elem_type = "float"; break;
+      case 'I': elem_type = "int"; break;
+      case 'J': elem_type = "long"; break;
+      case 'S': elem_type = "short"; break;
+      case 'Z': elem_type = "boolean"; break;
+      case 'L': {
+        // Object type: L<classname>;
+        p++;  // skip 'L'
+        size_t len = strlen(p);
+        if (len > 0 && p[len-1] == ';') len--;  // strip trailing ';'
+        if (len >= sizeof(class_buf)) len = sizeof(class_buf) - 1;
+        memcpy(class_buf, p, len);
+        class_buf[len] = '\0';
+        // Replace '/' with '.'
+        for (size_t i = 0; i < len; i++) {
+          if (class_buf[i] == '/') class_buf[i] = '.';
+        }
+        elem_type = class_buf;
+        break;
+      }
+      default:
+        // Unknown descriptor, pass through
+        strncpy(out, raw, out_len - 1);
+        out[out_len - 1] = '\0';
+        return;
+    }
+
+    // Build result: elem_type + "[]" * dims
+    size_t elem_len = strlen(elem_type);
+    size_t total_len = elem_len + (size_t)dims * 2;
+    if (total_len >= out_len) {
+      strncpy(out, raw, out_len - 1);
+      out[out_len - 1] = '\0';
+      return;
+    }
+    memcpy(out, elem_type, elem_len);
+    for (int i = 0; i < dims; i++) {
+      out[elem_len + i * 2] = '[';
+      out[elem_len + i * 2 + 1] = ']';
+    }
+    out[total_len] = '\0';
+    return;
+  }
+
+  // Not a descriptor format - pass through (already in Java format)
+  // Just replace any '/' with '.'
+  size_t len = strlen(raw);
+  if (len >= out_len) len = out_len - 1;
+  memcpy(out, raw, len);
+  out[len] = '\0';
+  for (size_t i = 0; i < len; i++) {
+    if (out[i] == '/') out[i] = '.';
+  }
+}
+
+// Hash a type name to a bucket index
+size_t EpsilonOracle::hash_type_name(const char* type_name) {
+  // djb2 hash
+  size_t hash = 5381;
+  const char* p = type_name;
+  while (*p) {
+    hash = ((hash << 5) + hash) + (unsigned char)*p;
+    p++;
+  }
+  return hash & (ThreadAllocState::TYPE_QUEUE_BUCKETS - 1);
+}
+
 EpsilonOracle::EpsilonOracle() :
   _entries(nullptr),
   _entry_count(0),
   _entry_capacity(0),
   _death_map(nullptr),
   _runtime_thread_map(nullptr),
-  _next_logical_thread_id(0),
+  _next_logical_thread_id(EpsilonOracleSkipThread0 ? 1 : 0),  // Skip thread 0 if ET overhead present
   _num_oracle_threads(0),
   _total_alloc_counter(0),
   _free_counter(0),
@@ -60,6 +163,7 @@ EpsilonOracle::EpsilonOracle() :
   _malloc_ptr_map(nullptr),
   _malloc_tracked_count(0),
   _malloc_freed_count(0),
+  _finalized(false),
   _oracle_lock(nullptr) {
 
   // Initialize matching stats
@@ -87,6 +191,22 @@ EpsilonOracle::EpsilonOracle() :
     _malloc_ptr_map = NEW_C_HEAP_ARRAY(MallocPtrBucket*, MALLOC_PTR_MAP_SIZE, mtGC);
     memset(_malloc_ptr_map, 0, sizeof(MallocPtrBucket*) * MALLOC_PTR_MAP_SIZE);
   }
+
+  // Initialize delayed-free buffer
+  _delayed_free_buf = nullptr;
+  _delayed_free_head = 0;
+  _delayed_free_tail = 0;
+  _delayed_free_count = 0;
+  if (EpsilonOracleFreeDelay > 0 && EpsilonOracleMallocMode) {
+    _delayed_free_buf = NEW_C_HEAP_ARRAY(DelayedFreeEntry, DELAYED_FREE_CAPACITY, mtGC);
+    memset(_delayed_free_buf, 0, sizeof(DelayedFreeEntry) * DELAYED_FREE_CAPACITY);
+    log_info(gc)("Oracle: Delayed-free buffer allocated (capacity=%zu, delay=%" PRIu64 " allocs)",
+                 DELAYED_FREE_CAPACITY, EpsilonOracleFreeDelay);
+  }
+
+  log_info(gc)("Oracle: Logical thread IDs start at %d (EpsilonOracleSkipThread0=%s)",
+               _next_logical_thread_id,
+               EpsilonOracleSkipThread0 ? "true" : "false");
 }
 
 EpsilonOracle::~EpsilonOracle() {
@@ -129,18 +249,59 @@ bool EpsilonOracle::load_trace(const char* path) {
     return false;
   }
 
-  // Parse CSV entries
-  // Format: alloc_thread,alloc_seq,free_thread,free_seq,size,type,obj_id
-  // Thread IDs are now LOGICAL (small integers 0, 1, 2, ...)
-  int alloc_thread, free_thread;
-  uint64_t alloc_seq, free_seq;
-  size_t size;
-  char type[512];
-  char obj_id[64];
+  // Detect column count from header: count commas to determine 7-col vs 9-col format
+  int header_commas = 0;
+  for (const char* p = line; *p; p++) {
+    if (*p == ',') header_commas++;
+  }
+  bool is_9col = (header_commas >= 8);
+  log_info(gc)("Oracle: Detected %d-column CSV format (commas=%d)",
+               is_9col ? 9 : 7, header_commas);
+
+  // Parse CSV entries using line-based parsing to handle both 7 and 9 column formats.
+  // 7-col: alloc_thread,alloc_seq,free_thread,free_seq,size,type,obj_id
+  // 9-col: alloc_thread,alloc_seq,free_thread,free_seq,size,type,type_hash,relative_lifetime,obj_id
   int32_t max_thread_id = -1;
 
-  while (fscanf(f, "%d,%" SCNu64 ",%d,%" SCNu64 ",%zu,%511[^,],%63s\n",
-                &alloc_thread, &alloc_seq, &free_thread, &free_seq, &size, type, obj_id) >= 6) {
+  while (fgets(line, sizeof(line), f) != nullptr) {
+    // Skip empty lines
+    size_t line_len = strlen(line);
+    if (line_len == 0) continue;
+    // Strip trailing newline/carriage return
+    while (line_len > 0 && (line[line_len - 1] == '\n' || line[line_len - 1] == '\r')) {
+      line[--line_len] = '\0';
+    }
+    if (line_len == 0) continue;
+
+    // Parse fields by splitting on commas
+    // We need: alloc_thread (0), alloc_seq (1), free_thread (2), free_seq (3), size (4), type (5)
+    // For 9-col, fields 6 and 7 (type_hash, relative_lifetime) are skipped; field 8 is obj_id (unused)
+    // For 7-col, field 6 is obj_id (unused)
+    char* fields[10];
+    int field_count = 0;
+    char* pos = line;
+    fields[0] = pos;
+    field_count = 1;
+
+    while (*pos && field_count < 10) {
+      if (*pos == ',') {
+        *pos = '\0';
+        pos++;
+        fields[field_count++] = pos;
+      } else {
+        pos++;
+      }
+    }
+
+    // Need at least 6 fields (alloc_thread through type)
+    if (field_count < 6) continue;
+
+    int alloc_thread = (int)strtol(fields[0], nullptr, 10);
+    uint64_t alloc_seq = (uint64_t)strtoull(fields[1], nullptr, 10);
+    int free_thread = (int)strtol(fields[2], nullptr, 10);
+    uint64_t free_seq = (uint64_t)strtoull(fields[3], nullptr, 10);
+    size_t size = (size_t)strtoull(fields[4], nullptr, 10);
+    const char* type = fields[5];
 
     // Grow array if needed
     if (_entry_count >= _entry_capacity) {
@@ -178,6 +339,8 @@ bool EpsilonOracle::load_trace(const char* path) {
   } else {
     // Build thread entry index for efficient lookup
     build_thread_entry_index();
+    // Build type-keyed FIFO queues for type-based matching
+    build_type_queues();
   }
 
   return true;
@@ -231,6 +394,73 @@ void EpsilonOracle::build_thread_entry_index() {
   }
 
   log_info(gc)("Oracle: Thread entry index built for %d logical threads", _num_oracle_threads);
+}
+
+void EpsilonOracle::build_type_queues() {
+  log_info(gc)("Oracle: Building type-keyed FIFO queues for %zu entries...", _entry_count);
+
+  // For each oracle entry, normalize the type name and add to the
+  // per-thread type queue. We pre-create ThreadAllocState for each
+  // thread seen in the oracle.
+  size_t total_queues = 0;
+  size_t total_nodes = 0;
+
+  for (size_t i = 0; i < _entry_count; i++) {
+    OracleEntry& entry = _entries[i];
+    int32_t logical_thread = entry.alloc_thread;
+
+    if (logical_thread < 0 || (size_t)logical_thread >= MAX_LOGICAL_THREADS) continue;
+
+    // Get or create thread state
+    ThreadAllocState* state = get_or_create_thread_state(logical_thread);
+    if (state == nullptr) continue;
+
+    // Normalize the oracle entry's type name in-place for consistency
+    char normalized[128];
+    normalize_type_name(entry.type, normalized, sizeof(normalized));
+    strncpy(entry.type, normalized, sizeof(entry.type) - 1);
+    entry.type[sizeof(entry.type) - 1] = '\0';
+
+    // Hash the normalized type name
+    size_t bucket = hash_type_name(normalized);
+
+    // Find or create type queue for this type in this thread's hash table
+    TypeQueue* queue = state->type_queues[bucket];
+    while (queue != nullptr) {
+      if (strcmp(queue->type_name, normalized) == 0) break;
+      queue = queue->next;
+    }
+
+    if (queue == nullptr) {
+      // Create new type queue
+      queue = NEW_C_HEAP_OBJ(TypeQueue, mtGC);
+      queue->head = nullptr;
+      queue->tail = nullptr;
+      queue->count = 0;
+      strncpy(queue->type_name, normalized, sizeof(queue->type_name) - 1);
+      queue->type_name[sizeof(queue->type_name) - 1] = '\0';
+      queue->next = state->type_queues[bucket];
+      state->type_queues[bucket] = queue;
+      total_queues++;
+    }
+
+    // Create node and enqueue at tail (FIFO)
+    TypeQueueNode* node = NEW_C_HEAP_OBJ(TypeQueueNode, mtGC);
+    node->entry_idx = i;
+    node->next = nullptr;
+
+    if (queue->tail != nullptr) {
+      queue->tail->next = node;
+    } else {
+      queue->head = node;
+    }
+    queue->tail = node;
+    queue->count++;
+    total_nodes++;
+  }
+
+  log_info(gc)("Oracle: Built %zu type queues with %zu total nodes across %d threads",
+               total_queues, total_nodes, _num_oracle_threads);
 }
 
 // Map a runtime OS thread ID to a logical thread ID
@@ -332,6 +562,9 @@ ThreadAllocState* EpsilonOracle::get_or_create_thread_state(int32_t logical_thre
   state->avg_lifetime = 100;  // Cold start default
   state->lifetime_sum = 0;
   state->lifetime_count = 0;
+
+  // Initialize type queue hash table
+  memset(state->type_queues, 0, sizeof(state->type_queues));
 
   _thread_states[logical_thread] = state;
 
@@ -462,14 +695,60 @@ uint64_t EpsilonOracle::compute_estimated_death(uint64_t lifetime, uint64_t curr
   return current_seq + state->avg_lifetime + delta;
 }
 
+void EpsilonOracle::schedule_death_relative(OracleEntry& entry, void* ptr, size_t size,
+                                             int32_t replay_logical_thread,
+                                             uint64_t replay_alloc_seq) {
+  // Use RELATIVE lifetime to handle allocation sequence divergence between trace and replay.
+  // The oracle entry records absolute (alloc_seq, free_seq) from the trace run.
+  // During replay, the per-thread allocation count may diverge due to filtering differences.
+  // By computing relative lifetime and adding it to the replay sequence, we preserve the
+  // correct object lifetime duration regardless of absolute sequence divergence.
+
+  int32_t target_thread;
+  uint64_t target_seq;
+
+  // FIX: For both same-thread and cross-thread frees, compute relative lifetime
+  // and schedule on the ALLOCATING thread. Cross-thread frees using absolute
+  // (free_thread, free_seq) are unreliable when the free_thread's allocation count
+  // diverges between trace and replay. Scheduling on the allocating thread with
+  // relative lifetime preserves the correct object lifetime duration.
+  uint64_t lifetime = (entry.free_seq > entry.alloc_seq)
+                      ? (entry.free_seq - entry.alloc_seq)
+                      : 1;  // Minimum lifetime of 1 to avoid immediate free
+  target_thread = replay_logical_thread;
+  target_seq = replay_alloc_seq + lifetime + EpsilonOracleGlobalDelta;
+
+  if (target_seq > 0) {
+    MutexLocker ml(_oracle_lock, Mutex::_no_safepoint_check_flag);
+
+    size_t bucket_idx = hash_thread_seq(target_thread, target_seq);
+    DeathBucket* bucket = NEW_C_HEAP_OBJ(DeathBucket, mtGC);
+    bucket->logical_thread = target_thread;
+    bucket->seq = target_seq;
+    bucket->ptr = ptr;
+    bucket->size = size;
+    bucket->next = _death_map[bucket_idx];
+    _death_map[bucket_idx] = bucket;
+  }
+}
+
 void EpsilonOracle::push_to_orphan_pool(ThreadAllocState* state, OracleEntry& entry) {
-  // Cap orphan pool size
+  // Cap orphan pool size - evict oldest (tail of list) when full
   if (state->orphan_count >= MAX_ORPHAN_POOL_SIZE) {
-    // Discard oldest (tail of list) - just drop head for simplicity
-    OrphanEntry* old = state->orphan_pool;
-    if (old != nullptr) {
-      state->orphan_pool = old->next;
-      FREE_C_HEAP_OBJ(old);
+    // Walk to the tail to evict the oldest entry
+    OrphanEntry* prev = nullptr;
+    OrphanEntry* curr = state->orphan_pool;
+    while (curr != nullptr && curr->next != nullptr) {
+      prev = curr;
+      curr = curr->next;
+    }
+    if (curr != nullptr) {
+      if (prev != nullptr) {
+        prev->next = nullptr;
+      } else {
+        state->orphan_pool = nullptr;
+      }
+      FREE_C_HEAP_OBJ(curr);
       state->orphan_count--;
     }
   }
@@ -527,9 +806,9 @@ void EpsilonOracle::update_lifetime_stats(ThreadAllocState* state, OracleEntry& 
   }
 }
 
-// --- Core allocation registration with resilient matching ---
+// --- Core allocation registration with type-keyed matching ---
 
-bool EpsilonOracle::register_allocation(int64_t runtime_thread_id, void* ptr, size_t size) {
+bool EpsilonOracle::register_allocation(int64_t runtime_thread_id, void* ptr, size_t size, const char* alloc_type) {
   // Map runtime thread to logical thread
   int32_t logical_thread = get_logical_thread(runtime_thread_id);
   if (logical_thread < 0) {
@@ -544,16 +823,120 @@ bool EpsilonOracle::register_allocation(int64_t runtime_thread_id, void* ptr, si
   }
   uint64_t per_thread_seq = state->alloc_count;  // Already incremented by caller
 
+  // Thread 0 handling controlled by EpsilonOracleSkipThread0 flag.
+  // When true (default): logical IDs start at 1, oracle thread 0 skipped.
+  // When false: logical IDs start at 0, first runtime thread matches oracle thread 0.
+  // Type-keyed FIFO handles divergence via TYPE_EXHAUSTED (leak safely).
+
   // ============================================================
-  // Step 1: Try cursor entry (perfect sequential match)
+  // Type-keyed FIFO matching (primary path when type is available)
+  // ============================================================
+  if (alloc_type != nullptr && alloc_type[0] != '\0') {
+    size_t bucket = hash_type_name(alloc_type);
+
+    // Find type queue for this type
+    TypeQueue* queue = state->type_queues[bucket];
+    while (queue != nullptr) {
+      if (strcmp(queue->type_name, alloc_type) == 0) break;
+      queue = queue->next;
+    }
+
+    if (queue != nullptr && queue->head != nullptr) {
+      // Scan FIFO for entry matching BOTH type AND size.
+      // FIFO order alone is unreliable when allocation patterns diverge between
+      // trace and replay. Size validation prevents assigning wrong lifetimes
+      // (e.g., a short-lived 144-byte byte[] lifetime to a 140KB byte[] buffer).
+      TypeQueueNode* prev = nullptr;
+      TypeQueueNode* node = queue->head;
+      TypeQueueNode* matched_node = nullptr;
+      int scan_count = 0;
+      int scan_limit = (int)EpsilonOracleLookahead;  // Reuse lookahead limit
+
+      while (node != nullptr && scan_count < scan_limit) {
+        OracleEntry& candidate = _entries[node->entry_idx];
+        if (candidate.size == size) {
+          // Found type+size match -- remove from FIFO
+          matched_node = node;
+          if (prev == nullptr) {
+            queue->head = node->next;
+          } else {
+            prev->next = node->next;
+          }
+          if (queue->tail == node) {
+            queue->tail = prev;
+          }
+          queue->count--;
+          break;
+        }
+        prev = node;
+        node = node->next;
+        scan_count++;
+      }
+
+      if (matched_node != nullptr) {
+        // Use RELATIVE lifetime from the matched oracle entry (fixes seq divergence)
+        OracleEntry& entry = _entries[matched_node->entry_idx];
+        update_lifetime_stats(state, entry);
+        schedule_death_relative(entry, ptr, size, logical_thread, per_thread_seq);
+
+        Atomic::add(&_matching_stats.type_matches, (uint64_t)1);
+        Atomic::add(&_tracked_alloc_counter, (uint64_t)1);
+        Atomic::add(&_allocated_bytes, size);
+
+        log_info(gc)("Oracle: TYPE_MATCH logical_thread=%d seq=%" PRIu64 " type=[%s] size=%zu ptr=" PTR_FORMAT
+                     " -> free at logical_thread=%d seq=%" PRIu64 " (scanned %d)",
+                     logical_thread, per_thread_seq, alloc_type, size, p2i(ptr),
+                     entry.free_thread, entry.free_seq, scan_count);
+
+        FREE_C_HEAP_OBJ(matched_node);
+        return true;
+      }
+
+      // Type matched but no size match within lookahead -- leak safely.
+      // The oracle entry is for a different-sized object of the same type.
+      Atomic::add(&_matching_stats.type_size_mismatch, (uint64_t)1);
+
+      log_debug(gc)("Oracle: TYPE_SIZE_MISMATCH logical_thread=%d seq=%" PRIu64 " type=[%s] size=%zu ptr=" PTR_FORMAT
+                    " (no size match in %d entries - leak safely)",
+                    logical_thread, per_thread_seq, alloc_type, size, p2i(ptr), scan_count);
+
+      return false;
+    }
+
+    // Type queue empty or not found - this allocation doesn't match any oracle entry.
+    // This is expected for JVM-internal allocations that happen while depth > 0
+    // (e.g., java.lang.Class, byte[] for class data during class loading).
+    // Leak safely: don't schedule any death. Estimated deaths cause premature frees
+    // and memory corruption because we have no oracle data for these objects.
+    Atomic::add(&_matching_stats.type_exhausted, (uint64_t)1);
+
+    log_debug(gc)("Oracle: TYPE_EXHAUSTED logical_thread=%d seq=%" PRIu64 " type=[%s] size=%zu ptr=" PTR_FORMAT
+                  " (no oracle entry - leak safely)",
+                  logical_thread, per_thread_seq, alloc_type, size, p2i(ptr));
+
+    return false;
+  }
+
+  // ============================================================
+  // Fallback: size-based matching (when type is not available)
+  // This shouldn't happen with -Xint + -XX:-UseTLAB but kept as safety net
+  // ============================================================
+  Atomic::add(&_matching_stats.type_fallback, (uint64_t)1);
+
+  log_debug(gc)("Oracle: TYPE_FALLBACK logical_thread=%d seq=%" PRIu64 " size=%zu ptr=" PTR_FORMAT
+                " (no type available, using size-based matching)",
+                logical_thread, per_thread_seq, size, p2i(ptr));
+
+  // ============================================================
+  // Step 1: Try cursor entry (perfect sequential match by size)
   // ============================================================
   if (cursor_has_entries(state, logical_thread)) {
     OracleEntry& entry = cursor_entry(state);
 
     if (entry.size == size) {
-      // Perfect match - use original death time
+      // Perfect match - use relative lifetime for resilient scheduling
       update_lifetime_stats(state, entry);
-      schedule_death_original(entry, ptr, size);
+      schedule_death_relative(entry, ptr, size, logical_thread, per_thread_seq);
       advance_cursor(state);
 
       Atomic::add(&_matching_stats.perfect_matches, (uint64_t)1);
@@ -594,10 +977,10 @@ bool EpsilonOracle::register_allocation(int64_t runtime_thread_id, void* ptr, si
           push_to_orphan_pool(state, _entries[j]);
         }
 
-        // Use matched entry's original death time
+        // Use matched entry's relative lifetime for resilient scheduling
         OracleEntry& matched = _entries[i];
         update_lifetime_stats(state, matched);
-        schedule_death_original(matched, ptr, size);
+        schedule_death_relative(matched, ptr, size, logical_thread, per_thread_seq);
 
         // Advance cursor past the matched entry
         state->next_entry_idx = i + 1;
@@ -769,12 +1152,8 @@ void EpsilonOracle::process_deaths_malloc_mode(int32_t logical_thread, uint64_t 
                      " size=%zu bytes (free_counter=%" PRIu64 ")",
                      logical_thread, per_thread_seq, p2i(ptr), size_in_bytes, _free_counter + 1);
 
-        // Actually free the memory
-        permit_forbidden_function::free(ptr);
-
-        // Update statistics
-        Atomic::add(&_free_counter, (uint64_t)1);
-        Atomic::add(&_freed_bytes, size_in_bytes);
+        // Free memory (possibly delayed to prevent use-after-free)
+        delayed_free(ptr, size_in_bytes);
       } else {
         log_warning(gc)("Oracle: MALLOC FREE failed - ptr=" PTR_FORMAT " not in tracking map",
                         p2i(ptr));
@@ -788,6 +1167,77 @@ void EpsilonOracle::process_deaths_malloc_mode(int32_t logical_thread, uint64_t 
     }
 
     bucket = next;
+  }
+}
+
+// --- Delayed free buffer ---
+
+void EpsilonOracle::delayed_free(void* ptr, size_t size) {
+  // Note: caller must hold _oracle_lock
+
+  // Fast path: no delay configured -- free immediately
+  if (EpsilonOracleFreeDelay == 0 || _delayed_free_buf == nullptr) {
+    permit_forbidden_function::free(ptr);
+    Atomic::add(&_free_counter, (uint64_t)1);
+    Atomic::add(&_freed_bytes, size);
+    return;
+  }
+
+  // If buffer full, force-drain oldest entry
+  if (_delayed_free_count >= DELAYED_FREE_CAPACITY) {
+    DelayedFreeEntry& oldest = _delayed_free_buf[_delayed_free_head];
+    log_debug(gc)("Oracle: DELAYED FREE (buffer full) ptr=" PTR_FORMAT " size=%zu age=%" PRIu64,
+                  p2i(oldest.ptr), oldest.size,
+                  _total_alloc_counter - oldest.freed_at_global_seq);
+    permit_forbidden_function::free(oldest.ptr);
+    Atomic::add(&_free_counter, (uint64_t)1);
+    Atomic::add(&_freed_bytes, oldest.size);
+    _delayed_free_head = (_delayed_free_head + 1) % DELAYED_FREE_CAPACITY;
+    _delayed_free_count--;
+  }
+
+  // Push to buffer
+  DelayedFreeEntry& entry = _delayed_free_buf[_delayed_free_tail];
+  entry.ptr = ptr;
+  entry.size = size;
+  entry.freed_at_global_seq = _total_alloc_counter;
+  _delayed_free_tail = (_delayed_free_tail + 1) % DELAYED_FREE_CAPACITY;
+  _delayed_free_count++;
+
+  // Drain entries that have aged past the delay
+  drain_delayed_frees();
+}
+
+void EpsilonOracle::drain_delayed_frees() {
+  // Note: caller must hold _oracle_lock
+  uint64_t current = _total_alloc_counter;
+  while (_delayed_free_count > 0) {
+    DelayedFreeEntry& entry = _delayed_free_buf[_delayed_free_head];
+    if (current - entry.freed_at_global_seq < EpsilonOracleFreeDelay) break;
+
+    log_debug(gc)("Oracle: DELAYED FREE ptr=" PTR_FORMAT " size=%zu age=%" PRIu64,
+                  p2i(entry.ptr), entry.size,
+                  current - entry.freed_at_global_seq);
+    permit_forbidden_function::free(entry.ptr);
+    Atomic::add(&_free_counter, (uint64_t)1);
+    Atomic::add(&_freed_bytes, entry.size);
+    _delayed_free_head = (_delayed_free_head + 1) % DELAYED_FREE_CAPACITY;
+    _delayed_free_count--;
+  }
+}
+
+void EpsilonOracle::drain_all_delayed_frees() {
+  // Force-free everything in the buffer regardless of age (for finalize)
+  // Note: caller must hold _oracle_lock
+  while (_delayed_free_count > 0) {
+    DelayedFreeEntry& entry = _delayed_free_buf[_delayed_free_head];
+    log_debug(gc)("Oracle: DELAYED FREE (finalize) ptr=" PTR_FORMAT " size=%zu",
+                  p2i(entry.ptr), entry.size);
+    permit_forbidden_function::free(entry.ptr);
+    Atomic::add(&_free_counter, (uint64_t)1);
+    Atomic::add(&_freed_bytes, entry.size);
+    _delayed_free_head = (_delayed_free_head + 1) % DELAYED_FREE_CAPACITY;
+    _delayed_free_count--;
   }
 }
 
@@ -837,6 +1287,9 @@ bool EpsilonOracle::untrack_malloc_ptr(void* ptr, size_t* out_size) {
 
 bool EpsilonOracle::is_malloc_tracked(void* ptr) const {
   if (_malloc_ptr_map == nullptr) return false;
+
+  // FIX: Acquire lock to prevent race with concurrent track/untrack operations
+  MutexLocker ml(_oracle_lock, Mutex::_no_safepoint_check_flag);
 
   size_t bucket_idx = hash_ptr(ptr);
   MallocPtrBucket* bucket = _malloc_ptr_map[bucket_idx];
@@ -931,12 +1384,19 @@ void EpsilonOracle::print_stats() const {
   log_info(gc)("  Frees:              %" PRIu64, _free_counter);
   log_info(gc)("  Bytes allocated:    %zu", _allocated_bytes);
   log_info(gc)("  Bytes freed:        %zu", _freed_bytes);
-  log_info(gc)("  Bytes live:         %zu", _allocated_bytes - _freed_bytes);
+  // FIX: Guard unsigned subtraction to prevent wrap-around
+  log_info(gc)("  Bytes live:         %zu",
+               (_allocated_bytes > _freed_bytes) ? (_allocated_bytes - _freed_bytes) : 0);
   log_info(gc)("  Oracle threads:     %d", _num_oracle_threads);
   log_info(gc)("  Runtime threads:    %d", _next_logical_thread_id);
 
-  // Resilient matching statistics
+  // Matching statistics
   log_info(gc)("  Matching statistics:");
+  log_info(gc)("    Thread 0 skipped: %" PRIu64, _matching_stats.thread0_skipped);
+  log_info(gc)("    Type matches:     %" PRIu64, _matching_stats.type_matches);
+  log_info(gc)("    Type exhausted:   %" PRIu64, _matching_stats.type_exhausted);
+  log_info(gc)("    Type size mism:   %" PRIu64, _matching_stats.type_size_mismatch);
+  log_info(gc)("    Type fallback:    %" PRIu64, _matching_stats.type_fallback);
   log_info(gc)("    Perfect matches:  %" PRIu64, _matching_stats.perfect_matches);
   log_info(gc)("    Lookahead matches:%" PRIu64, _matching_stats.lookahead_matches);
   log_info(gc)("    Orphan matches:   %" PRIu64, _matching_stats.orphan_matches);
@@ -944,17 +1404,23 @@ void EpsilonOracle::print_stats() const {
   log_info(gc)("    Oracle exhausted: %" PRIu64, _matching_stats.oracle_exhausted);
   log_info(gc)("    Total skipped:    %" PRIu64, _matching_stats.total_skipped);
 
-  uint64_t total_matched = _matching_stats.perfect_matches + _matching_stats.lookahead_matches +
+  uint64_t total_matched = _matching_stats.type_matches +
+                           _matching_stats.perfect_matches +
+                           _matching_stats.lookahead_matches +
                            _matching_stats.orphan_matches + _matching_stats.estimated_deaths +
                            _matching_stats.oracle_exhausted;
   if (total_matched > 0) {
-    log_info(gc)("    Perfect rate:     %.1f%%", 100.0 * _matching_stats.perfect_matches / total_matched);
+    log_info(gc)("    Type match rate:  %.1f%%", 100.0 * _matching_stats.type_matches / total_matched);
   }
 
   if (EpsilonOracleMallocMode) {
     log_info(gc)("  Malloc mode:        ENABLED");
     log_info(gc)("  Malloc tracked:     %zu", _malloc_tracked_count);
     log_info(gc)("  Malloc freed:       %zu", _malloc_freed_count);
+    if (EpsilonOracleFreeDelay > 0) {
+      log_info(gc)("  Free delay:         %" PRIu64 " allocs", EpsilonOracleFreeDelay);
+      log_info(gc)("  Delayed free pending:%zu", _delayed_free_count);
+    }
   } else {
     log_info(gc)("  Free list blocks:   %zu", _free_list_count);
     log_info(gc)("  Free list bytes:    %zu", _free_list_bytes);
@@ -972,7 +1438,21 @@ void EpsilonOracle::print_stats() const {
 }
 
 void EpsilonOracle::finalize() {
+  // FIX: Guard against double-finalize
+  if (_finalized) {
+    log_warning(gc)("Oracle finalize: Already finalized, skipping");
+    return;
+  }
+  _finalized = true;
+
   log_info(gc)("Oracle finalize: Processing remaining tracked objects...");
+
+  // First, drain any entries still in the delayed-free buffer
+  if (_delayed_free_count > 0) {
+    MutexLocker ml(_oracle_lock, Mutex::_no_safepoint_check_flag);
+    log_info(gc)("Oracle finalize: Draining %zu delayed-free entries", _delayed_free_count);
+    drain_all_delayed_frees();
+  }
 
   size_t remaining_count = 0;
   size_t remaining_bytes = 0;
@@ -1029,11 +1509,16 @@ void EpsilonOracle::finalize() {
 
   // Matching breakdown
   log_info(gc)("  Matching breakdown:");
-  log_info(gc)("    Perfect:    %" PRIu64, _matching_stats.perfect_matches);
-  log_info(gc)("    Lookahead:  %" PRIu64, _matching_stats.lookahead_matches);
-  log_info(gc)("    Orphan:     %" PRIu64, _matching_stats.orphan_matches);
-  log_info(gc)("    Estimated:  %" PRIu64, _matching_stats.estimated_deaths);
-  log_info(gc)("    Exhausted:  %" PRIu64, _matching_stats.oracle_exhausted);
+  log_info(gc)("    Thread0 skip:   %" PRIu64, _matching_stats.thread0_skipped);
+  log_info(gc)("    Type match:     %" PRIu64, _matching_stats.type_matches);
+  log_info(gc)("    Type exhausted: %" PRIu64, _matching_stats.type_exhausted);
+  log_info(gc)("    Type size mism: %" PRIu64, _matching_stats.type_size_mismatch);
+  log_info(gc)("    Type fallback:  %" PRIu64, _matching_stats.type_fallback);
+  log_info(gc)("    Perfect:        %" PRIu64, _matching_stats.perfect_matches);
+  log_info(gc)("    Lookahead:      %" PRIu64, _matching_stats.lookahead_matches);
+  log_info(gc)("    Orphan:         %" PRIu64, _matching_stats.orphan_matches);
+  log_info(gc)("    Estimated:      %" PRIu64, _matching_stats.estimated_deaths);
+  log_info(gc)("    Exhausted:      %" PRIu64, _matching_stats.oracle_exhausted);
 
   // Verify all tracked allocations were freed
   if (_tracked_alloc_counter == _free_counter) {
@@ -1043,6 +1528,21 @@ void EpsilonOracle::finalize() {
     log_warning(gc)("Oracle: WARNING - Tracked allocs (%" PRIu64 ") != Frees (%" PRIu64 ")",
                     _tracked_alloc_counter, _free_counter);
   }
+
+  // Print InterpreterRuntime filter diagnostics
+  extern void oracle_print_filter_stats();
+  oracle_print_filter_stats();
+
+  // Print EpsilonHeap allocation counters
+  extern volatile uint64_t _total_oracle_alloc_calls;
+  extern volatile uint64_t _total_oracle_alloc_pre_app;
+  extern volatile uint64_t _total_oracle_alloc_system;
+  extern volatile uint64_t _total_oracle_alloc_tracked;
+  log_info(gc)("EpsilonHeap allocation path stats:");
+  log_info(gc)("  Total allocate_work_oracle calls: %" PRIu64, _total_oracle_alloc_calls);
+  log_info(gc)("  Pre-app allocations:              %" PRIu64, _total_oracle_alloc_pre_app);
+  log_info(gc)("  System (untracked) allocations:   %" PRIu64, _total_oracle_alloc_system);
+  log_info(gc)("  Tracked (oracle) allocations:     %" PRIu64, _total_oracle_alloc_tracked);
 }
 
 void EpsilonOracle::cleanup() {
@@ -1072,6 +1572,24 @@ void EpsilonOracle::cleanup() {
         orphan = next;
       }
       state->orphan_pool = nullptr;
+
+      // Clean up type queues for this thread
+      for (size_t b = 0; b < ThreadAllocState::TYPE_QUEUE_BUCKETS; b++) {
+        TypeQueue* queue = state->type_queues[b];
+        while (queue != nullptr) {
+          TypeQueue* next_queue = queue->next;
+          // Free all nodes in this queue
+          TypeQueueNode* node = queue->head;
+          while (node != nullptr) {
+            TypeQueueNode* next_node = node->next;
+            FREE_C_HEAP_OBJ(node);
+            node = next_node;
+          }
+          FREE_C_HEAP_OBJ(queue);
+          queue = next_queue;
+        }
+        state->type_queues[b] = nullptr;
+      }
 
       FREE_C_HEAP_OBJ(state);
       _thread_states[i] = nullptr;
@@ -1120,6 +1638,13 @@ void EpsilonOracle::cleanup() {
     _malloc_ptr_map = nullptr;
   }
 
+  // Free delayed-free buffer
+  if (_delayed_free_buf != nullptr) {
+    FREE_C_HEAP_ARRAY(DelayedFreeEntry, _delayed_free_buf);
+    _delayed_free_buf = nullptr;
+    _delayed_free_count = 0;
+  }
+
   // Free entries array
   if (_entries != nullptr) {
     FREE_C_HEAP_ARRAY(OracleEntry, _entries);
@@ -1135,7 +1660,7 @@ void EpsilonOracle::cleanup() {
   }
 }
 
-// Global C functions for JVMTI agent to call via dlsym
+// Global C functions exported for JVMTI agent communication via dlsym
 
 // Signal application start (called by Elephant Tracks or similar agent)
 extern "C" __attribute__((visibility("default"))) void epsilon_oracle_signal_app_start() {
@@ -1143,67 +1668,4 @@ extern "C" __attribute__((visibility("default"))) void epsilon_oracle_signal_app
   if (heap != nullptr && heap->oracle() != nullptr) {
     heap->oracle()->signal_app_start();
   }
-}
-
-// Enter app code: increment JVM-side thread-local depth counter
-// Called by OracleSignal agent via libOracleSignal native library
-extern "C" __attribute__((visibility("default"))) void epsilon_oracle_enter_app_code() {
-  Thread* thread = Thread::current();
-  if (thread != nullptr && UseEpsilonGC) {
-    int depth = EpsilonThreadLocalData::app_code_depth(thread) + 1;
-    EpsilonThreadLocalData::set_app_code_depth(thread, depth);
-  }
-}
-
-// Exit app code: decrement JVM-side thread-local depth counter
-extern "C" __attribute__((visibility("default"))) void epsilon_oracle_exit_app_code() {
-  Thread* thread = Thread::current();
-  if (thread != nullptr && UseEpsilonGC) {
-    int depth = EpsilonThreadLocalData::app_code_depth(thread) - 1;
-    if (depth < 0) depth = 0;
-    EpsilonThreadLocalData::set_app_code_depth(thread, depth);
-  }
-}
-
-// Suppress/restore tracking: used during agent overhead (class transformation)
-// to prevent javassist allocations from being counted as app allocations
-extern "C" __attribute__((visibility("default"))) void epsilon_oracle_suppress_tracking(bool suppress) {
-  Thread* thread = Thread::current();
-  if (thread != nullptr && UseEpsilonGC) {
-    EpsilonThreadLocalData::set_tracking_suppressed(thread, suppress);
-  }
-}
-
-// Get current app code depth (for debugging / Java-side queries)
-extern "C" __attribute__((visibility("default"))) int epsilon_oracle_get_app_code_depth() {
-  Thread* thread = Thread::current();
-  if (thread != nullptr && UseEpsilonGC) {
-    return EpsilonThreadLocalData::app_code_depth(thread);
-  }
-  return 0;
-}
-
-// Set the app code depth counter directly (compat API)
-extern "C" __attribute__((visibility("default"))) void epsilon_oracle_set_app_code_depth(int depth) {
-  Thread* thread = Thread::current();
-  if (thread != nullptr && UseEpsilonGC) {
-    EpsilonThreadLocalData::set_app_code_depth(thread, depth);
-  }
-}
-
-// Set the app allocation pending flag (legacy boolean API, kept for compatibility)
-extern "C" __attribute__((visibility("default"))) void epsilon_oracle_set_app_alloc_pending(bool pending) {
-  Thread* thread = Thread::current();
-  if (thread != nullptr && UseEpsilonGC) {
-    EpsilonThreadLocalData::set_app_allocation_pending(thread, pending);
-  }
-}
-
-// Get the app allocation pending flag (for debugging)
-extern "C" __attribute__((visibility("default"))) bool epsilon_oracle_get_app_alloc_pending() {
-  Thread* thread = Thread::current();
-  if (thread != nullptr && UseEpsilonGC) {
-    return EpsilonThreadLocalData::in_app_code(thread);
-  }
-  return false;
 }
