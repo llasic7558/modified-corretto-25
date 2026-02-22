@@ -148,7 +148,7 @@ EpsilonOracle::EpsilonOracle() :
   _entry_capacity(0),
   _death_map(nullptr),
   _runtime_thread_map(nullptr),
-  _next_logical_thread_id(EpsilonOracleSkipThread0 ? 1 : 0),  // Skip thread 0 if ET overhead present
+  _skip_start(EpsilonOracleSkipThread0 ? 1 : 0),  // First assignable logical ID
   _num_oracle_threads(0),
   _total_alloc_counter(0),
   _free_counter(0),
@@ -186,11 +186,22 @@ EpsilonOracle::EpsilonOracle() :
   // Initialize thread entry index (for logical threads)
   memset(_thread_entry_index, 0, sizeof(_thread_entry_index));
 
+  // Initialize thread signatures (for content-based thread matching)
+  memset(_thread_signatures, 0, sizeof(_thread_signatures));
+
+  // Initialize runtime thread buffer map (for multi-sig buffering)
+  memset(_runtime_buffers, 0, sizeof(_runtime_buffers));
+
   // Allocate malloc pointer tracking map if in malloc mode
   if (EpsilonOracleMallocMode) {
     _malloc_ptr_map = NEW_C_HEAP_ARRAY(MallocPtrBucket*, MALLOC_PTR_MAP_SIZE, mtGC);
     memset(_malloc_ptr_map, 0, sizeof(MallocPtrBucket*) * MALLOC_PTR_MAP_SIZE);
   }
+
+  // Initialize TYPE_EXHAUSTED diagnostic array
+  _type_exhausted_diag = NEW_C_HEAP_ARRAY(TypeExhaustedDiag, TYPE_EXHAUSTED_DIAG_CAPACITY, mtGC);
+  _type_exhausted_diag_count = 0;
+  memset(_type_exhausted_diag, 0, sizeof(TypeExhaustedDiag) * TYPE_EXHAUSTED_DIAG_CAPACITY);
 
   // Initialize delayed-free buffer
   _delayed_free_buf = nullptr;
@@ -205,7 +216,7 @@ EpsilonOracle::EpsilonOracle() :
   }
 
   log_info(gc)("Oracle: Logical thread IDs start at %d (EpsilonOracleSkipThread0=%s)",
-               _next_logical_thread_id,
+               _skip_start,
                EpsilonOracleSkipThread0 ? "true" : "false");
 }
 
@@ -340,7 +351,12 @@ bool EpsilonOracle::load_trace(const char* path) {
     // Build thread entry index for efficient lookup
     build_thread_entry_index();
     // Build type-keyed FIFO queues for type-based matching
+    // NOTE: build_type_queues normalizes entry types IN-PLACE, so it MUST run
+    // before build_thread_signatures which reads the normalized types.
     build_type_queues();
+    // Build first-allocation signatures for content-based thread matching
+    // (must run AFTER build_type_queues so types are already normalized)
+    build_thread_signatures();
   }
 
   return true;
@@ -394,6 +410,135 @@ void EpsilonOracle::build_thread_entry_index() {
   }
 
   log_info(gc)("Oracle: Thread entry index built for %d logical threads", _num_oracle_threads);
+}
+
+void EpsilonOracle::build_thread_signatures() {
+  // Build multi-allocation signatures for content-based thread matching.
+  // For each oracle thread, record the first K allocations' (type, size).
+  // At runtime, when a new thread makes tracked allocations, we compare
+  // against these K-deep signatures instead of just the first allocation.
+  size_t sig_depth = EpsilonOracleSignatureDepth;
+  if (sig_depth > (size_t)ThreadMultiSignature::MAX_SIG_DEPTH) {
+    sig_depth = ThreadMultiSignature::MAX_SIG_DEPTH;
+  }
+
+  log_info(gc)("Oracle: Building multi-allocation signatures (depth=%zu)...", sig_depth);
+
+  int sigs_built = 0;
+  for (int32_t t = 0; t < _num_oracle_threads && (size_t)t < MAX_LOGICAL_THREADS; t++) {
+    ThreadEntryIndex& idx = _thread_entry_index[t];
+    ThreadMultiSignature& sig = _thread_signatures[t];
+    sig.count = 0;
+    sig.claimed = false;
+
+    size_t entries_to_record = (idx.entry_count < sig_depth) ? idx.entry_count : sig_depth;
+    for (size_t i = 0; i < entries_to_record; i++) {
+      OracleEntry& entry = _entries[idx.first_entry_idx + i];
+      strncpy(sig.entries[i].type, entry.type, sizeof(sig.entries[i].type) - 1);
+      sig.entries[i].type[sizeof(sig.entries[i].type) - 1] = '\0';
+      sig.entries[i].size = entry.size;
+      sig.count++;
+    }
+
+    if (sig.count > 0) {
+      sigs_built++;
+      log_info(gc)("Oracle: Thread %d signature: depth=%d first_type=[%s] first_size=%zu (entries=%zu)",
+                   t, sig.count, sig.entries[0].type, sig.entries[0].size, idx.entry_count);
+    }
+  }
+
+  // Warn about duplicate first-allocation signatures (triggers buffering mode)
+  for (int32_t t1 = 0; t1 < _num_oracle_threads && (size_t)t1 < MAX_LOGICAL_THREADS; t1++) {
+    if (_thread_signatures[t1].count == 0) continue;
+    for (int32_t t2 = t1 + 1; t2 < _num_oracle_threads && (size_t)t2 < MAX_LOGICAL_THREADS; t2++) {
+      if (_thread_signatures[t2].count == 0) continue;
+      if (strcmp(_thread_signatures[t1].entries[0].type, _thread_signatures[t2].entries[0].type) == 0 &&
+          _thread_signatures[t1].entries[0].size == _thread_signatures[t2].entries[0].size) {
+        log_info(gc)("Oracle: DUPLICATE FIRST-SIG threads %d and %d both start with "
+                     "type=[%s] size=%zu -- will use multi-sig scoring for disambiguation",
+                     t1, t2, _thread_signatures[t1].entries[0].type,
+                     _thread_signatures[t1].entries[0].size);
+      }
+    }
+  }
+
+  log_info(gc)("Oracle: Built %d multi-allocation signatures (depth=%zu)", sigs_built, sig_depth);
+}
+
+int EpsilonOracle::score_thread_match(const RuntimeThreadBuffer* buffer, int32_t oracle_thread) const {
+  if (oracle_thread < 0 || (size_t)oracle_thread >= MAX_LOGICAL_THREADS) return 0;
+  const ThreadMultiSignature& sig = _thread_signatures[oracle_thread];
+
+  int score = 0;
+  int compare_depth = (buffer->count < sig.count) ? buffer->count : sig.count;
+
+  for (int i = 0; i < compare_depth; i++) {
+    if (strcmp(buffer->buffer[i].type, sig.entries[i].type) == 0) {
+      if (buffer->buffer[i].size == sig.entries[i].size) {
+        score += 2;  // Type + size match
+      } else {
+        score += 1;  // Type-only match
+      }
+    }
+  }
+  return score;
+}
+
+int32_t EpsilonOracle::finalize_buffered_mapping(int64_t runtime_thread_id, RuntimeThreadBuffer* buffer) {
+  // Score all candidates and pick the best
+  int best_score = -1;
+  int32_t best_thread = -1;
+
+  for (int i = 0; i < buffer->candidate_count; i++) {
+    int32_t candidate = buffer->candidates[i];
+    if (_thread_signatures[candidate].claimed) continue;  // Already taken
+
+    int s = score_thread_match(buffer, candidate);
+    log_info(gc)("Oracle: MULTI-SIG SCORE runtime thread %" PRId64 " vs oracle thread %d: %d/%d",
+                 runtime_thread_id, candidate, s, buffer->count * 2);
+
+    if (s > best_score) {
+      best_score = s;
+      best_thread = candidate;
+    }
+  }
+
+  // Require score > K (50% match) to accept
+  int threshold = (int)EpsilonOracleSignatureDepth;
+  if (best_thread >= 0 && best_score >= threshold) {
+    _thread_signatures[best_thread].claimed = true;
+    Atomic::add(&_matching_stats.buffered_map, (uint64_t)1);
+    log_info(gc)("Oracle: BUFFERED_MAP runtime thread %" PRId64 " -> logical %d "
+                 "(score=%d/%d, threshold=%d)",
+                 runtime_thread_id, best_thread, best_score, buffer->count * 2, threshold);
+    return best_thread;
+  }
+
+  // Fallback: sequential assignment among candidates
+  for (int i = 0; i < buffer->candidate_count; i++) {
+    int32_t candidate = buffer->candidates[i];
+    if (!_thread_signatures[candidate].claimed) {
+      _thread_signatures[candidate].claimed = true;
+      Atomic::add(&_matching_stats.fallback_map, (uint64_t)1);
+      log_warning(gc)("Oracle: FALLBACK_MAP runtime thread %" PRId64 " -> logical %d "
+                      "(best_score=%d below threshold=%d)",
+                      runtime_thread_id, candidate, best_score, threshold);
+      return candidate;
+    }
+  }
+
+  // All candidates claimed, use global sequential fallback
+  for (int32_t t = _skip_start; (size_t)t < MAX_LOGICAL_THREADS; t++) {
+    if (!_thread_signatures[t].claimed) {
+      _thread_signatures[t].claimed = true;
+      Atomic::add(&_matching_stats.fallback_map, (uint64_t)1);
+      log_warning(gc)("Oracle: FALLBACK_MAP (global) runtime thread %" PRId64 " -> logical %d",
+                      runtime_thread_id, t);
+      return t;
+    }
+  }
+
+  return -1;  // No slots available
 }
 
 void EpsilonOracle::build_type_queues() {
@@ -463,16 +608,22 @@ void EpsilonOracle::build_type_queues() {
                total_queues, total_nodes, _num_oracle_threads);
 }
 
-// Map a runtime OS thread ID to a logical thread ID
-// Returns the logical ID, assigning a new one if this is the first time seeing this thread
-int32_t EpsilonOracle::map_runtime_to_logical(int64_t runtime_thread_id) {
+// Map a runtime OS thread ID to a logical thread ID using two-phase
+// multi-allocation signature matching.
+// Phase 1: If the first allocation's (type, size) uniquely matches one oracle
+//   thread signature, map immediately.
+// Phase 2: If multiple oracle threads share the same first-sig, buffer K
+//   allocations and score against all candidates. Returns -2 during buffering.
+// Fallback: Sequential assignment if scoring fails.
+int32_t EpsilonOracle::map_runtime_to_logical(int64_t runtime_thread_id,
+                                               const char* alloc_type, size_t alloc_size) {
   if (!_app_started) {
     return -1;  // Don't map threads before app starts
   }
 
   size_t bucket_idx = hash_runtime_thread(runtime_thread_id);
 
-  // First check without lock (common case: already mapped)
+  // --- Fast path: already mapped ---
   RuntimeThreadMapping* mapping = _runtime_thread_map[bucket_idx];
   while (mapping != nullptr) {
     if (mapping->runtime_thread_id == runtime_thread_id) {
@@ -481,7 +632,45 @@ int32_t EpsilonOracle::map_runtime_to_logical(int64_t runtime_thread_id) {
     mapping = mapping->next;
   }
 
-  // Need to create mapping - take lock
+  // --- Check if this thread is in buffering mode (no mapping yet, buffer exists) ---
+  size_t buf_idx = ((uint64_t)runtime_thread_id * 2654435761ULL) & (RUNTIME_BUFFER_MAP_SIZE - 1);
+  RuntimeThreadBuffer* buffer = _runtime_buffers[buf_idx];
+  if (buffer != nullptr) {
+    // Add this allocation to buffer
+    if (alloc_type != nullptr && buffer->count < RuntimeThreadBuffer::MAX_BUFFER) {
+      strncpy(buffer->buffer[buffer->count].type, alloc_type,
+              sizeof(buffer->buffer[0].type) - 1);
+      buffer->buffer[buffer->count].type[sizeof(buffer->buffer[0].type) - 1] = '\0';
+      buffer->buffer[buffer->count].size = alloc_size;
+      buffer->count++;
+    }
+
+    // Check if buffer is full -> finalize mapping
+    if ((size_t)buffer->count >= EpsilonOracleSignatureDepth) {
+      MutexLocker ml(_oracle_lock, Mutex::_no_safepoint_check_flag);
+      uint64_t leaked_count = (uint64_t)buffer->count;
+      int32_t logical_id = finalize_buffered_mapping(runtime_thread_id, buffer);
+
+      // Record leaked count BEFORE freeing buffer
+      Atomic::add(&_matching_stats.buffered_leaked, leaked_count);
+      FREE_C_HEAP_OBJ(buffer);
+      _runtime_buffers[buf_idx] = nullptr;
+
+      if (logical_id >= 0) {
+        // Create the real mapping now
+        RuntimeThreadMapping* new_mapping = NEW_C_HEAP_OBJ(RuntimeThreadMapping, mtGC);
+        new_mapping->runtime_thread_id = runtime_thread_id;
+        new_mapping->logical_thread_id = logical_id;
+        new_mapping->next = _runtime_thread_map[bucket_idx];
+        _runtime_thread_map[bucket_idx] = new_mapping;
+        return logical_id;
+      }
+    }
+
+    return -2;  // Still buffering
+  }
+
+  // --- Need to create mapping - take lock ---
   MutexLocker ml(_oracle_lock, Mutex::_no_safepoint_check_flag);
 
   // Double-check after acquiring lock
@@ -493,16 +682,106 @@ int32_t EpsilonOracle::map_runtime_to_logical(int64_t runtime_thread_id) {
     mapping = mapping->next;
   }
 
-  // Assign next logical thread ID
-  int32_t logical_id = Atomic::add(&_next_logical_thread_id, (int32_t)1) - 1;
+  // --- Phase 1: Try immediate mapping (unique first-sig match) ---
+  int32_t logical_id = -1;
 
-  if (logical_id >= _num_oracle_threads) {
-    // More runtime threads than oracle threads - this allocation won't be tracked
-    log_debug(gc)("Oracle: Runtime thread %" PRId64 " mapped to logical %d (beyond oracle's %d threads)",
-                  runtime_thread_id, logical_id, _num_oracle_threads);
-  } else {
-    log_info(gc)("Oracle: Runtime thread %" PRId64 " mapped to logical thread %d",
-                 runtime_thread_id, logical_id);
+  if (alloc_type != nullptr && alloc_type[0] != '\0') {
+    // Count candidates: oracle threads whose first allocation matches (type, size)
+    int32_t candidates[MAX_LOGICAL_THREADS];
+    int candidate_count = 0;
+
+    for (int32_t t = _skip_start; t < _num_oracle_threads && (size_t)t < MAX_LOGICAL_THREADS; t++) {
+      if (_thread_signatures[t].claimed || _thread_signatures[t].count == 0) continue;
+      if (strcmp(_thread_signatures[t].entries[0].type, alloc_type) == 0 &&
+          _thread_signatures[t].entries[0].size == alloc_size) {
+        if (candidate_count < (int)MAX_LOGICAL_THREADS) {
+          candidates[candidate_count++] = t;
+        }
+      }
+    }
+
+    if (candidate_count == 1) {
+      // Unique match -> map immediately
+      logical_id = candidates[0];
+      _thread_signatures[logical_id].claimed = true;
+      Atomic::add(&_matching_stats.immediate_map, (uint64_t)1);
+      log_info(gc)("Oracle: IMMEDIATE_MAP runtime thread %" PRId64 " -> logical %d "
+                   "(type=[%s] size=%zu, unique first-sig)",
+                   runtime_thread_id, logical_id, alloc_type, alloc_size);
+    } else if (candidate_count > 1) {
+      // Multiple matches -> enter buffering mode
+      log_info(gc)("Oracle: BUFFERING runtime thread %" PRId64 " (%d candidates for "
+                   "type=[%s] size=%zu) -- will score after %zu allocations",
+                   runtime_thread_id, candidate_count, alloc_type, alloc_size,
+                   (size_t)EpsilonOracleSignatureDepth);
+
+      // Allocate buffer
+      RuntimeThreadBuffer* new_buffer = NEW_C_HEAP_OBJ(RuntimeThreadBuffer, mtGC);
+      memset(new_buffer, 0, sizeof(RuntimeThreadBuffer));
+      new_buffer->candidate_count = candidate_count;
+      for (int i = 0; i < candidate_count && i < (int)MAX_LOGICAL_THREADS; i++) {
+        new_buffer->candidates[i] = candidates[i];
+      }
+
+      // Add first allocation to buffer
+      strncpy(new_buffer->buffer[0].type, alloc_type, sizeof(new_buffer->buffer[0].type) - 1);
+      new_buffer->buffer[0].type[sizeof(new_buffer->buffer[0].type) - 1] = '\0';
+      new_buffer->buffer[0].size = alloc_size;
+      new_buffer->count = 1;
+
+      _runtime_buffers[buf_idx] = new_buffer;
+
+      // Return -2 to signal "buffering, allocate without oracle tracking"
+      return -2;
+    } else {
+      // No first-sig match -> try type-only match
+      for (int32_t t = _skip_start; t < _num_oracle_threads && (size_t)t < MAX_LOGICAL_THREADS; t++) {
+        if (!_thread_signatures[t].claimed &&
+            _thread_signatures[t].count > 0 &&
+            strcmp(_thread_signatures[t].entries[0].type, alloc_type) == 0) {
+          logical_id = t;
+          _thread_signatures[t].claimed = true;
+          Atomic::add(&_matching_stats.immediate_map, (uint64_t)1);
+          log_info(gc)("Oracle: IMMEDIATE_MAP (type-only) runtime thread %" PRId64
+                       " -> logical %d (type=[%s] sig_size=%zu alloc_size=%zu)",
+                       runtime_thread_id, logical_id, alloc_type,
+                       _thread_signatures[t].entries[0].size, alloc_size);
+          break;
+        }
+      }
+    }
+  }
+
+  // --- Fallback: sequential assignment ---
+  if (logical_id < 0) {
+    for (int32_t t = _skip_start; t < _num_oracle_threads && (size_t)t < MAX_LOGICAL_THREADS; t++) {
+      if (!_thread_signatures[t].claimed) {
+        logical_id = t;
+        _thread_signatures[t].claimed = true;
+        break;
+      }
+    }
+    if (logical_id < 0) {
+      for (int32_t t = _num_oracle_threads; (size_t)t < MAX_LOGICAL_THREADS; t++) {
+        if (!_thread_signatures[t].claimed) {
+          logical_id = t;
+          _thread_signatures[t].claimed = true;
+          break;
+        }
+      }
+    }
+
+    if (logical_id < 0) {
+      log_warning(gc)("Oracle: All logical thread slots claimed, runtime thread %" PRId64
+                      " unmappable", runtime_thread_id);
+      return -1;
+    }
+
+    Atomic::add(&_matching_stats.fallback_map, (uint64_t)1);
+    log_info(gc)("Oracle: FALLBACK_MAP runtime thread %" PRId64 " -> logical %d "
+                 "(type=[%s] size=%zu)",
+                 runtime_thread_id, logical_id,
+                 (alloc_type ? alloc_type : "?"), alloc_size);
   }
 
   // Create and insert mapping
@@ -608,9 +887,10 @@ uint64_t EpsilonOracle::get_thread_alloc_count(int32_t logical_thread) {
   return state->alloc_count;
 }
 
-uint64_t EpsilonOracle::next_thread_alloc_seq(int64_t runtime_thread_id) {
-  // Map runtime thread to logical thread
-  int32_t logical_thread = map_runtime_to_logical(runtime_thread_id);
+uint64_t EpsilonOracle::next_thread_alloc_seq(int64_t runtime_thread_id,
+                                                const char* alloc_type, size_t alloc_size) {
+  // Map runtime thread to logical thread (uses signature matching on first allocation)
+  int32_t logical_thread = map_runtime_to_logical(runtime_thread_id, alloc_type, alloc_size);
   if (logical_thread < 0) {
     return 0;  // App not started yet
   }
@@ -698,25 +978,90 @@ uint64_t EpsilonOracle::compute_estimated_death(uint64_t lifetime, uint64_t curr
 void EpsilonOracle::schedule_death_relative(OracleEntry& entry, void* ptr, size_t size,
                                              int32_t replay_logical_thread,
                                              uint64_t replay_alloc_seq) {
-  // Use RELATIVE lifetime to handle allocation sequence divergence between trace and replay.
-  // The oracle entry records absolute (alloc_seq, free_seq) from the trace run.
-  // During replay, the per-thread allocation count may diverge due to filtering differences.
-  // By computing relative lifetime and adding it to the replay sequence, we preserve the
-  // correct object lifetime duration regardless of absolute sequence divergence.
+  // Schedule object death using the oracle entry's timing information.
+  // Two strategies depending on whether free happens on the same or different thread:
+
+  // --- ClassLoader protection ---
+  // Never free ClassLoader objects. The JVM's ClassLoaderDataGraph holds live references
+  // to classloader instances that persist beyond oracle-scheduled death times.
+  // Freeing them causes is_oop() assertion failures during JVM shutdown.
+  // Also protect java.lang.Class objects which participate in class loading metadata.
+  if (entry.type[0] != '\0') {
+    if (strstr(entry.type, "ClassLoader") != nullptr ||
+        strcmp(entry.type, "java.lang.Class") == 0 ||
+        strncmp(entry.type, "org.dacapo.", 11) == 0) {
+      Atomic::add(&_matching_stats.classloader_leaked, (uint64_t)1);
+      log_info(gc)("Oracle: INFRASTRUCTURE_LEAKED type=[%s] size=%zu ptr=" PTR_FORMAT
+                   " -- infrastructure protection, leak safely",
+                   entry.type, size, p2i(ptr));
+      return;  // Don't schedule death -- leak this object
+    }
+  }
 
   int32_t target_thread;
   uint64_t target_seq;
 
-  // FIX: For both same-thread and cross-thread frees, compute relative lifetime
-  // and schedule on the ALLOCATING thread. Cross-thread frees using absolute
-  // (free_thread, free_seq) are unreliable when the free_thread's allocation count
-  // diverges between trace and replay. Scheduling on the allocating thread with
-  // relative lifetime preserves the correct object lifetime duration.
-  uint64_t lifetime = (entry.free_seq > entry.alloc_seq)
-                      ? (entry.free_seq - entry.alloc_seq)
-                      : 1;  // Minimum lifetime of 1 to avoid immediate free
-  target_thread = replay_logical_thread;
-  target_seq = replay_alloc_seq + lifetime + EpsilonOracleGlobalDelta;
+  if (entry.free_thread == entry.alloc_thread) {
+    // SAME-THREAD FREE: Use relative lifetime for resilience against sequence divergence.
+    // lifetime = free_seq - alloc_seq is meaningful because both are on the same per-thread clock.
+    // Adding this to the replay's current sequence preserves the correct object lifetime
+    // even if the absolute allocation counts differ between trace and replay.
+    uint64_t lifetime = (entry.free_seq > entry.alloc_seq)
+                        ? (entry.free_seq - entry.alloc_seq)
+                        : 1;  // Minimum lifetime of 1 to avoid immediate free
+
+    // --- FIX A: Detect and leak long-lived singleton objects ---
+    // Objects whose lifetime spans >= 90% of the oracle thread's total entries
+    // are effectively "live until JVM exit" singletons (e.g., java.util.Locale).
+    // In the trace, GC freed them at shutdown; freeing them during replay causes
+    // use-after-free / SIGSEGV because the program still references them.
+    // Leak these objects safely instead of scheduling a premature death.
+    int32_t oracle_thread = entry.alloc_thread;
+    if (oracle_thread >= 0 && (size_t)oracle_thread < MAX_LOGICAL_THREADS) {
+      size_t thread_total_entries = _thread_entry_index[oracle_thread].entry_count;
+      if (thread_total_entries > 0) {
+        // Use integer arithmetic: lifetime * 10 >= thread_total_entries * 9 means >= 90%
+        if (lifetime * 10 >= (uint64_t)thread_total_entries * 9) {
+          Atomic::add(&_matching_stats.longlived_leaked, (uint64_t)1);
+          log_info(gc)("Oracle: LONGLIVED_LEAKED type=[%s] size=%zu ptr=" PTR_FORMAT
+                       " lifetime=%" PRIu64 " thread_entries=%zu (%.1f%% of thread %d entries)"
+                       " -- singleton protection, leak safely",
+                       entry.type, size, p2i(ptr),
+                       lifetime, thread_total_entries,
+                       100.0 * lifetime / thread_total_entries, oracle_thread);
+          return;  // Do NOT schedule death -- leak this object
+        }
+      }
+    }
+
+    target_thread = replay_logical_thread;
+    target_seq = replay_alloc_seq + lifetime + EpsilonOracleGlobalDelta;
+
+    // --- FIX B: Hard cap -- never schedule death beyond oracle horizon ---
+    // If the computed target_seq exceeds the replay thread's current sequence
+    // by more than the total oracle entries for that thread, we are extrapolating
+    // beyond what the oracle knows. This can happen when replay diverges
+    // significantly from the trace. Leak safely instead.
+    if (replay_logical_thread >= 0 && (size_t)replay_logical_thread < MAX_LOGICAL_THREADS) {
+      size_t replay_thread_entries = _thread_entry_index[replay_logical_thread].entry_count;
+      if (replay_thread_entries > 0 && target_seq > replay_alloc_seq + (uint64_t)replay_thread_entries) {
+        Atomic::add(&_matching_stats.longlived_leaked, (uint64_t)1);
+        log_info(gc)("Oracle: HORIZON_LEAKED type=[%s] size=%zu ptr=" PTR_FORMAT
+                     " target_seq=%" PRIu64 " exceeds replay_seq=%" PRIu64
+                     " + thread_entries=%zu -- beyond oracle horizon, leak safely",
+                     entry.type, size, p2i(ptr),
+                     target_seq, replay_alloc_seq, replay_thread_entries);
+        return;  // Do NOT schedule death -- beyond oracle horizon
+      }
+    }
+  } else {
+    // CROSS-THREAD FREE: Use original (free_thread, free_seq) directly.
+    // Relative lifetime (free_seq - alloc_seq) is meaningless across different per-thread
+    // clocks. The runtime filters match ET's bytecode instrumentation filtering, so
+    // per-thread allocation counts should closely match the oracle.
+    target_thread = entry.free_thread;
+    target_seq = entry.free_seq + EpsilonOracleGlobalDelta;
+  }
 
   if (target_seq > 0) {
     MutexLocker ml(_oracle_lock, Mutex::_no_safepoint_check_flag);
@@ -909,6 +1254,7 @@ bool EpsilonOracle::register_allocation(int64_t runtime_thread_id, void* ptr, si
     // Leak safely: don't schedule any death. Estimated deaths cause premature frees
     // and memory corruption because we have no oracle data for these objects.
     Atomic::add(&_matching_stats.type_exhausted, (uint64_t)1);
+    record_type_exhausted_diag(alloc_type);
 
     log_debug(gc)("Oracle: TYPE_EXHAUSTED logical_thread=%d seq=%" PRIu64 " type=[%s] size=%zu ptr=" PTR_FORMAT
                   " (no oracle entry - leak safely)",
@@ -1285,7 +1631,7 @@ bool EpsilonOracle::untrack_malloc_ptr(void* ptr, size_t* out_size) {
   return false;
 }
 
-bool EpsilonOracle::is_malloc_tracked(void* ptr) const {
+bool EpsilonOracle::is_malloc_tracked(void* ptr) {
   if (_malloc_ptr_map == nullptr) return false;
 
   // FIX: Acquire lock to prevent race with concurrent track/untrack operations
@@ -1388,7 +1734,12 @@ void EpsilonOracle::print_stats() const {
   log_info(gc)("  Bytes live:         %zu",
                (_allocated_bytes > _freed_bytes) ? (_allocated_bytes - _freed_bytes) : 0);
   log_info(gc)("  Oracle threads:     %d", _num_oracle_threads);
-  log_info(gc)("  Runtime threads:    %d", _next_logical_thread_id);
+  // Count claimed runtime threads
+  int claimed_count = 0;
+  for (size_t i = 0; i < MAX_LOGICAL_THREADS; i++) {
+    if (_thread_signatures[i].claimed) claimed_count++;
+  }
+  log_info(gc)("  Runtime threads:    %d", claimed_count);
 
   // Matching statistics
   log_info(gc)("  Matching statistics:");
@@ -1403,6 +1754,12 @@ void EpsilonOracle::print_stats() const {
   log_info(gc)("    Estimated deaths: %" PRIu64, _matching_stats.estimated_deaths);
   log_info(gc)("    Oracle exhausted: %" PRIu64, _matching_stats.oracle_exhausted);
   log_info(gc)("    Total skipped:    %" PRIu64, _matching_stats.total_skipped);
+  log_info(gc)("    Long-lived leaked:%" PRIu64, _matching_stats.longlived_leaked);
+  log_info(gc)("  Thread mapping statistics:");
+  log_info(gc)("    Immediate map:    %" PRIu64, _matching_stats.immediate_map);
+  log_info(gc)("    Buffered map:     %" PRIu64, _matching_stats.buffered_map);
+  log_info(gc)("    Fallback map:     %" PRIu64, _matching_stats.fallback_map);
+  log_info(gc)("    Buffered leaked:  %" PRIu64, _matching_stats.buffered_leaked);
 
   uint64_t total_matched = _matching_stats.type_matches +
                            _matching_stats.perfect_matches +
@@ -1519,6 +1876,15 @@ void EpsilonOracle::finalize() {
   log_info(gc)("    Orphan:         %" PRIu64, _matching_stats.orphan_matches);
   log_info(gc)("    Estimated:      %" PRIu64, _matching_stats.estimated_deaths);
   log_info(gc)("    Exhausted:      %" PRIu64, _matching_stats.oracle_exhausted);
+  log_info(gc)("    Long-lived leak:%" PRIu64, _matching_stats.longlived_leaked);
+  log_info(gc)("    Classloader leak:%" PRIu64, _matching_stats.classloader_leaked);
+  // Print TYPE_EXHAUSTED diagnostic breakdown
+  print_type_exhausted_diag();
+  log_info(gc)("  Thread mapping:");
+  log_info(gc)("    Immediate map:  %" PRIu64, _matching_stats.immediate_map);
+  log_info(gc)("    Buffered map:   %" PRIu64, _matching_stats.buffered_map);
+  log_info(gc)("    Fallback map:   %" PRIu64, _matching_stats.fallback_map);
+  log_info(gc)("    Buffered leaked:%" PRIu64, _matching_stats.buffered_leaked);
 
   // Verify all tracked allocations were freed
   if (_tracked_alloc_counter == _free_counter) {
@@ -1545,6 +1911,52 @@ void EpsilonOracle::finalize() {
   log_info(gc)("  Tracked (oracle) allocations:     %" PRIu64, _total_oracle_alloc_tracked);
 }
 
+void EpsilonOracle::record_type_exhausted_diag(const char* type_name) {
+  if (type_name == nullptr || type_name[0] == '\0') return;
+
+  // Linear scan — fewer than 500 distinct types expected
+  for (size_t i = 0; i < _type_exhausted_diag_count; i++) {
+    if (strcmp(_type_exhausted_diag[i].type, type_name) == 0) {
+      _type_exhausted_diag[i].count++;
+      return;
+    }
+  }
+
+  // New type — add if capacity allows
+  if (_type_exhausted_diag_count < TYPE_EXHAUSTED_DIAG_CAPACITY) {
+    strncpy(_type_exhausted_diag[_type_exhausted_diag_count].type, type_name, 127);
+    _type_exhausted_diag[_type_exhausted_diag_count].type[127] = '\0';
+    _type_exhausted_diag[_type_exhausted_diag_count].count = 1;
+    _type_exhausted_diag_count++;
+  }
+}
+
+void EpsilonOracle::print_type_exhausted_diag() {
+  if (_type_exhausted_diag_count == 0) return;
+
+  // Simple insertion sort by count descending (small array, one-time operation)
+  for (size_t i = 1; i < _type_exhausted_diag_count; i++) {
+    TypeExhaustedDiag temp = _type_exhausted_diag[i];
+    size_t j = i;
+    while (j > 0 && _type_exhausted_diag[j - 1].count < temp.count) {
+      _type_exhausted_diag[j] = _type_exhausted_diag[j - 1];
+      j--;
+    }
+    _type_exhausted_diag[j] = temp;
+  }
+
+  log_info(gc)("  TYPE_EXHAUSTED breakdown (top 20 types):");
+  size_t limit = _type_exhausted_diag_count < 20 ? _type_exhausted_diag_count : 20;
+  for (size_t i = 0; i < limit; i++) {
+    log_info(gc)("    %3zu. [%s] = %" PRIu64, i + 1,
+                 _type_exhausted_diag[i].type,
+                 _type_exhausted_diag[i].count);
+  }
+  if (_type_exhausted_diag_count > 20) {
+    log_info(gc)("    ... and %zu more types", _type_exhausted_diag_count - 20);
+  }
+}
+
 void EpsilonOracle::cleanup() {
   // Clean up death map
   if (_death_map != nullptr) {
@@ -1558,6 +1970,12 @@ void EpsilonOracle::cleanup() {
     }
     FREE_C_HEAP_ARRAY(DeathBucket*, _death_map);
     _death_map = nullptr;
+  }
+
+  // Clean up TYPE_EXHAUSTED diagnostic array
+  if (_type_exhausted_diag != nullptr) {
+    FREE_C_HEAP_ARRAY(TypeExhaustedDiag, _type_exhausted_diag);
+    _type_exhausted_diag = nullptr;
   }
 
   // Clean up per-thread state array (indexed by logical thread ID)
@@ -1608,6 +2026,14 @@ void EpsilonOracle::cleanup() {
     }
     FREE_C_HEAP_ARRAY(RuntimeThreadMapping*, _runtime_thread_map);
     _runtime_thread_map = nullptr;
+  }
+
+  // Clean up runtime thread buffers (from multi-sig buffering)
+  for (size_t i = 0; i < RUNTIME_BUFFER_MAP_SIZE; i++) {
+    if (_runtime_buffers[i] != nullptr) {
+      FREE_C_HEAP_OBJ(_runtime_buffers[i]);
+      _runtime_buffers[i] = nullptr;
+    }
   }
 
   // Thread entry index is a direct array (not heap-allocated), just zero it

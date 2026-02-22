@@ -122,6 +122,41 @@ struct OracleMatchingStats {
   volatile uint64_t type_exhausted;      // Type queue empty (leak safely)
   volatile uint64_t type_size_mismatch;  // Type matched but size mismatch (leak safely)
   volatile uint64_t type_fallback;       // Type not available, fell back to size matching
+  volatile uint64_t longlived_leaked;    // Long-lived singletons leaked (lifetime >= 90% of thread entries)
+  volatile uint64_t classloader_leaked;  // ClassLoader objects leaked (JVM holds live refs past oracle death)
+  volatile uint64_t immediate_map;       // Thread mapped on first allocation (unique sig)
+  volatile uint64_t buffered_map;        // Thread mapped after K-allocation scoring
+  volatile uint64_t fallback_map;        // Thread mapped via sequential fallback
+  volatile uint64_t buffered_leaked;     // Allocations leaked during buffering phase
+};
+
+// Multi-allocation thread signature: records first K allocations per oracle thread
+// for robust content-based thread matching. Single-signature matching fails when
+// multiple DaCapo worker threads start with the same (type, size) allocation.
+struct ThreadMultiSignature {
+  static const int MAX_SIG_DEPTH = 64;
+  struct SigEntry {
+    char type[128];       // Normalized type name
+    size_t size;          // Allocation size in bytes
+  };
+  SigEntry entries[MAX_SIG_DEPTH];  // First K allocations for this oracle thread
+  int count;              // Actual entries recorded (min of K, thread's total allocs)
+  bool claimed;           // True if a runtime thread has claimed this oracle thread
+};
+
+// Per-runtime-thread buffer for delayed mapping (Phase 2 of multi-sig matching).
+// When a runtime thread's first allocation matches multiple oracle thread signatures,
+// we buffer subsequent allocations and score them against candidates.
+struct RuntimeThreadBuffer {
+  static const int MAX_BUFFER = 64;
+  struct BufEntry {
+    char type[128];       // Normalized type name of this allocation
+    size_t size;          // Allocation size in bytes
+  };
+  BufEntry buffer[MAX_BUFFER];   // Buffered allocation (type, size) pairs
+  int count;              // Allocations buffered so far
+  int32_t candidates[256]; // Candidate oracle thread IDs (MAX_LOGICAL_THREADS)
+  int candidate_count;    // Number of candidates
 };
 
 // Per-thread allocation state (keyed by LOGICAL thread ID)
@@ -180,8 +215,25 @@ private:
   // Runtime thread ID -> logical thread ID mapping
   static const size_t RUNTIME_THREAD_MAP_SIZE = 1 << 10;  // 1K buckets
   RuntimeThreadMapping** _runtime_thread_map;
-  volatile int32_t _next_logical_thread_id;  // Next logical ID to assign
+  int32_t _skip_start;  // First assignable logical ID (1 if SkipThread0, else 0)
   int32_t _num_oracle_threads;  // Number of unique threads in the oracle
+
+  // Multi-allocation thread signatures for robust thread mapping.
+  // Instead of matching just the first allocation's (type, size), we record
+  // the first K allocations per oracle thread and use multi-sig scoring
+  // to disambiguate threads with identical first allocations.
+  ThreadMultiSignature _thread_signatures[MAX_LOGICAL_THREADS];
+  void build_thread_signatures();
+
+  // Runtime thread buffering for Phase 2 delayed mapping
+  static const size_t RUNTIME_BUFFER_MAP_SIZE = 1 << 8;  // 256 buckets
+  RuntimeThreadBuffer* _runtime_buffers[RUNTIME_BUFFER_MAP_SIZE];
+
+  // Score a runtime thread's buffer against an oracle thread's multi-signature
+  int score_thread_match(const RuntimeThreadBuffer* buffer, int32_t oracle_thread) const;
+
+  // Finalize buffered thread mapping: pick best candidate and map
+  int32_t finalize_buffered_mapping(int64_t runtime_thread_id, RuntimeThreadBuffer* buffer);
 
   // Index to quickly find first entry for each LOGICAL thread
   // Direct array access since logical IDs are small
@@ -221,6 +273,20 @@ private:
   // Maximum orphan pool entries per thread
   static const size_t MAX_ORPHAN_POOL_SIZE = 1024;
 
+  // Diagnostic: per-type counters for TYPE_EXHAUSTED allocations
+  static const size_t TYPE_EXHAUSTED_DIAG_CAPACITY = 512;
+  struct TypeExhaustedDiag {
+    char type[128];
+    uint64_t count;
+  };
+  TypeExhaustedDiag* _type_exhausted_diag;
+  size_t _type_exhausted_diag_count;
+
+  // Record a TYPE_EXHAUSTED allocation for diagnostics
+  void record_type_exhausted_diag(const char* type_name);
+  // Print TYPE_EXHAUSTED diagnostic summary
+  void print_type_exhausted_diag();
+
   // Double-finalize guard
   bool _finalized;
 
@@ -228,7 +294,7 @@ private:
   Mutex* _oracle_lock;
 
   // Delayed-free circular buffer (for EpsilonOracleFreeDelay > 0)
-  static const size_t DELAYED_FREE_CAPACITY = 1 << 16;  // 64K entries
+  static const size_t DELAYED_FREE_CAPACITY = 1 << 21;  // 2M entries (enough for ~970K alloc workloads)
   DelayedFreeEntry* _delayed_free_buf;
   size_t _delayed_free_head;   // Next entry to drain (oldest)
   size_t _delayed_free_tail;   // Next entry to write
@@ -252,8 +318,12 @@ private:
   }
 
   // Map runtime OS thread ID to logical thread ID
-  // Returns -1 if app not started, or assigns new logical ID if first time seeing this thread
-  int32_t map_runtime_to_logical(int64_t runtime_thread_id);
+  // Returns -1 if app not started, or assigns new logical ID if first time seeing this thread.
+  // Uses content-based signature matching: on first allocation, the (alloc_type, alloc_size)
+  // is compared against oracle thread first-allocation signatures to find the correct mapping.
+  // Falls back to sequential assignment if no signature match.
+  int32_t map_runtime_to_logical(int64_t runtime_thread_id,
+                                  const char* alloc_type = nullptr, size_t alloc_size = 0);
 
   // Hash function for malloc pointer tracking
   size_t hash_ptr(void* ptr) const {
@@ -342,8 +412,11 @@ public:
   uint64_t get_thread_alloc_count(int32_t logical_thread);
 
   // Increment and return per-thread allocation count (takes runtime OS thread ID)
-  // Returns 0 if app not started or thread couldn't be mapped
-  uint64_t next_thread_alloc_seq(int64_t runtime_thread_id);
+  // Returns 0 if app not started or thread couldn't be mapped.
+  // alloc_type and alloc_size are passed through to map_runtime_to_logical() for
+  // content-based thread signature matching on the thread's first allocation.
+  uint64_t next_thread_alloc_seq(int64_t runtime_thread_id,
+                                  const char* alloc_type = nullptr, size_t alloc_size = 0);
 
   // Get logical thread ID for a runtime thread (or -1 if not mapped)
   int32_t get_logical_thread(int64_t runtime_thread_id) const;

@@ -144,7 +144,14 @@
   product(bool, EpsilonOracleVerboseTracking, false, EXPERIMENTAL,          \
           "Log each tracked application allocation with thread ID, "        \
           "method class, method name, and allocated type. Useful for "      \
-          "verifying trace-side and replay-side filter agreement.")
+          "verifying trace-side and replay-side filter agreement.")          \
+                                                                            \
+  product(size_t, EpsilonOracleSignatureDepth, 32, EXPERIMENTAL,            \
+          "Number of initial allocations per thread to use for "            \
+          "multi-allocation signature matching. Higher values improve "     \
+          "thread mapping accuracy but delay mapping and leak more "        \
+          "allocations during the buffering phase.")                        \
+          range(1, 64)
 
 // end of GC_EPSILON_FLAGS
 

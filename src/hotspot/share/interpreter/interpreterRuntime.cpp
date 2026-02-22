@@ -213,39 +213,47 @@ JRT_END
 
 
 //------------------------------------------------------------------------------------------------------------------------
-// Oracle GC: JVM-internal allocation detection
+// Oracle GC: allocation tracking matching Elephant Tracks bytecode instrumentation
 //
-// Check if current allocation site should be tracked by Oracle GC.
-// Matches ET's allocation tracking: non-bootstrap class, non-skipped method.
-// This replaces the external OracleSignalAgent — no bytecode rewriting needed.
+// ET uses javassist bytecode instrumentation (NOT JVMTI VMObjectAlloc) to track allocations.
+// ET only instruments non-JDK classes and skips certain methods. We must match this exactly
+// so the runtime per-thread allocation sequence stays in sync with the oracle.
+//
+// ET's filtering (DynamicInstrumenter.shouldIgnore + MethodInstrumenter.shouldIgnoreMethod):
+//   Class-level:  skip java/*, javax/*, jdk/*, sun/*, com/sun/* (JDK classes)
+//   Method-level: skip <init>, <clinit>, equals, hashCode, finalize, toString,
+//                 wait, notify, notifyAll, lambda$*, access$*
+//
+// We approximate the class-level filter by checking the bootstrap class loader
+// (equivalent to ET's JDK class name prefix check).
 // Diagnostic counters for oracle allocation filtering
 static volatile int _oracle_skip_boot = 0;
-static volatile int _oracle_skip_init = 0;
-static volatile int _oracle_skip_clinit = 0;
-static volatile int _oracle_skip_method = 0;
-static volatile int _oracle_skip_lambda = 0;
-static volatile int _oracle_skip_access = 0;
 static volatile int _oracle_tracked = 0;
 static volatile int _oracle_total_calls = 0;
-// Per-thread first-rejection logging: track which threads we've logged
-static volatile int _oracle_logged_thread_count = 0;
 
 static bool oracle_should_track_allocation(JavaThread* current, ConstantPool* pool, Klass* alloc_klass = nullptr) {
   if (!UseEpsilonGC || !EpsilonOracleMode) return false;
 
   Atomic::inc(&_oracle_total_calls);
 
-  // Check allocation site is in non-bootstrap class (matches ET's class filtering)
+  // Class-level filter: skip allocations in JDK classes.
+  // Uses EXACT name-prefix check matching ET's shouldIgnore() (DynamicInstrumenter.java:215-240).
+  // ET checks class name prefixes: java/, javax/, jdk/, sun/, com/sun/.
+  // We use the same check instead of boot-classloader to avoid divergence
+  // (boot classloader != name prefix for all cases).
   InstanceKlass* pool_holder = pool->pool_holder();
-  if (pool_holder->class_loader_data()->is_boot_class_loader_data()) {
+  const char* klass_name = pool_holder->name()->as_C_string(); // internal format: java/lang/String
+  if (strncmp(klass_name, "java/", 5) == 0 ||
+      strncmp(klass_name, "javax/", 6) == 0 ||
+      strncmp(klass_name, "jdk/", 4) == 0 ||
+      strncmp(klass_name, "sun/", 4) == 0 ||
+      strncmp(klass_name, "com/sun/", 8) == 0) {
     Atomic::inc(&_oracle_skip_boot);
-    // Log first 10 boot-class rejections for diagnosis
-    int boot_count = _oracle_skip_boot;
-    if (boot_count <= 10 && EpsilonOracleVerboseTracking) {
+    if (_oracle_skip_boot <= 10 && EpsilonOracleVerboseTracking) {
       LastFrameAccessor last_frame2(current);
       Method* method2 = last_frame2.method();
       const char* alloc_type2 = (alloc_klass != nullptr) ? alloc_klass->external_name() : "<unknown>";
-      log_info(gc)("Oracle SKIP_BOOT: class=%s method=%s alloc_type=%s",
+      log_info(gc)("Oracle SKIP_JDK: class=%s method=%s alloc_type=%s",
                    pool_holder->external_name(),
                    method2->name()->as_C_string(),
                    alloc_type2);
@@ -253,34 +261,22 @@ static bool oracle_should_track_allocation(JavaThread* current, ConstantPool* po
     return false;
   }
 
-  // Check method is not in ET's skip list (MethodInstrumenter.shouldIgnoreMethod())
-  LastFrameAccessor last_frame(current);
-  Method* method = last_frame.method();
-  Symbol* name = method->name();
-
-  if (name == vmSymbols::object_initializer_name()) { Atomic::inc(&_oracle_skip_init); return false; }
-  if (name == vmSymbols::class_initializer_name()) { Atomic::inc(&_oracle_skip_clinit); return false; }
-  if (name == vmSymbols::equals_name() ||
-      name == vmSymbols::toString_name() ||
-      name == vmSymbols::finalize_method_name() ||
-      name->equals("hashCode") ||
-      name->equals("wait") ||
-      name->equals("notify") ||
-      name->equals("notifyAll")) {
-    Atomic::inc(&_oracle_skip_method);
-    return false;
-  }
-  if (name->starts_with("lambda$")) { Atomic::inc(&_oracle_skip_lambda); return false; }
-  if (name->starts_with("access$")) { Atomic::inc(&_oracle_skip_access); return false; }
+  // NOTE: Method-level filtering (<init>, <clinit>, etc.) was REMOVED.
+  // ET records allocations inside ALL methods of instrumented classes, including
+  // <init> constructors. ET's shouldIgnoreMethod() only controls M/E events,
+  // NOT allocation tracking. So InterpreterRuntime must track all allocations
+  // in non-bootstrap classes to match the oracle.
 
   Atomic::inc(&_oracle_tracked);
 
   if (EpsilonOracleVerboseTracking) {
+    LastFrameAccessor last_frame(current);
+    Method* method = last_frame.method();
     const char* alloc_type = (alloc_klass != nullptr) ? alloc_klass->external_name() : "<unknown>";
     log_info(gc)("Oracle TRACK: thread=" PTR_FORMAT " class=%s method=%s alloc_type=%s",
                  p2i(current),
                  pool_holder->external_name(),
-                 name->as_C_string(),
+                 method->name()->as_C_string(),
                  alloc_type);
   }
 
@@ -290,15 +286,10 @@ static bool oracle_should_track_allocation(JavaThread* current, ConstantPool* po
 // Called at JVM shutdown to print oracle filter diagnostics
 void oracle_print_filter_stats() {
   if (!UseEpsilonGC || !EpsilonOracleMode) return;
-  log_info(gc)("Oracle filter stats:");
+  log_info(gc)("Oracle filter stats (class-prefix matching ET's shouldIgnore):");
   log_info(gc)("  Total calls:    %d", _oracle_total_calls);
   log_info(gc)("  Tracked:        %d", _oracle_tracked);
-  log_info(gc)("  Skip boot:      %d", _oracle_skip_boot);
-  log_info(gc)("  Skip <init>:    %d", _oracle_skip_init);
-  log_info(gc)("  Skip <clinit>:  %d", _oracle_skip_clinit);
-  log_info(gc)("  Skip method:    %d", _oracle_skip_method);
-  log_info(gc)("  Skip lambda$:   %d", _oracle_skip_lambda);
-  log_info(gc)("  Skip access$:   %d", _oracle_skip_access);
+  log_info(gc)("  Skip JDK:       %d", _oracle_skip_boot);
 }
 
 //------------------------------------------------------------------------------------------------------------------------
@@ -320,11 +311,13 @@ JRT_ENTRY(void, InterpreterRuntime::_new(JavaThread* current, ConstantPool* pool
     EpsilonThreadLocalData::set_app_code_depth(current, 1);
   }
 
-  oop obj = klass->allocate_instance(CHECK);
+  // Use THREAD instead of CHECK to ensure app_code_depth is reset on exception
+  oop obj = klass->allocate_instance(THREAD);
 
   if (oracle_track) {
     EpsilonThreadLocalData::set_app_code_depth(current, 0);
   }
+  if (HAS_PENDING_EXCEPTION) return;
 
   current->set_vm_result_oop(obj);
 JRT_END
@@ -346,11 +339,13 @@ JRT_ENTRY(void, InterpreterRuntime::newarray(JavaThread* current, BasicType type
     }
   }
 
-  oop obj = oopFactory::new_typeArray(type, size, CHECK);
+  // Use THREAD instead of CHECK to ensure app_code_depth is reset on exception
+  oop obj = oopFactory::new_typeArray(type, size, THREAD);
 
   if (oracle_track) {
     EpsilonThreadLocalData::set_app_code_depth(current, 0);
   }
+  if (HAS_PENDING_EXCEPTION) return;
 
   current->set_vm_result_oop(obj);
 JRT_END
@@ -364,11 +359,13 @@ JRT_ENTRY(void, InterpreterRuntime::anewarray(JavaThread* current, ConstantPool*
     EpsilonThreadLocalData::set_app_code_depth(current, 1);
   }
 
-  objArrayOop obj = oopFactory::new_objArray(klass, size, CHECK);
+  // Use THREAD instead of CHECK to ensure app_code_depth is reset on exception
+  objArrayOop obj = oopFactory::new_objArray(klass, size, THREAD);
 
   if (oracle_track) {
     EpsilonThreadLocalData::set_app_code_depth(current, 0);
   }
+  if (HAS_PENDING_EXCEPTION) return;
 
   current->set_vm_result_oop(obj);
 JRT_END
@@ -402,11 +399,13 @@ JRT_ENTRY(void, InterpreterRuntime::multianewarray(JavaThread* current, jint* fi
     int n = Interpreter::local_offset_in_bytes(index)/jintSize;
     dims[index] = first_size_address[n];
   }
-  oop obj = ArrayKlass::cast(klass)->multi_allocate(nof_dims, dims, CHECK);
+  // Use THREAD instead of CHECK to ensure app_code_depth is reset on exception
+  oop obj = ArrayKlass::cast(klass)->multi_allocate(nof_dims, dims, THREAD);
 
   if (oracle_track) {
     EpsilonThreadLocalData::set_app_code_depth(current, 0);
   }
+  if (HAS_PENDING_EXCEPTION) return;
 
   current->set_vm_result_oop(obj);
 JRT_END
