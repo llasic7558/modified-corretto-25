@@ -434,7 +434,8 @@ void EpsilonOracle::build_thread_signatures() {
     size_t entries_to_record = (idx.entry_count < sig_depth) ? idx.entry_count : sig_depth;
     for (size_t i = 0; i < entries_to_record; i++) {
       OracleEntry& entry = _entries[idx.first_entry_idx + i];
-      strncpy(sig.entries[i].type, entry.type, sizeof(sig.entries[i].type) - 1);
+      // Use memcpy + explicit null-termination to avoid GCC 11 -Wstringop-truncation
+      memcpy(sig.entries[i].type, entry.type, sizeof(sig.entries[i].type) - 1);
       sig.entries[i].type[sizeof(sig.entries[i].type) - 1] = '\0';
       sig.entries[i].size = entry.size;
       sig.count++;
