@@ -128,6 +128,7 @@ struct OracleMatchingStats {
   volatile uint64_t buffered_map;        // Thread mapped after K-allocation scoring
   volatile uint64_t fallback_map;        // Thread mapped via sequential fallback
   volatile uint64_t buffered_leaked;     // Allocations leaked during buffering phase
+  volatile uint64_t buffer_collision;     // Hash collisions in runtime buffer map
 };
 
 // Multi-allocation thread signature: records first K allocations per oracle thread
@@ -149,6 +150,7 @@ struct ThreadMultiSignature {
 // we buffer subsequent allocations and score them against candidates.
 struct RuntimeThreadBuffer {
   static const int MAX_BUFFER = 64;
+  int64_t runtime_thread_id;  // OS thread ID that owns this buffer slot
   struct BufEntry {
     char type[128];       // Normalized type name of this allocation
     size_t size;          // Allocation size in bytes

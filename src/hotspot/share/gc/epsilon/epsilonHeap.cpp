@@ -309,10 +309,21 @@ HeapWord* EpsilonHeap::allocate_work_oracle(size_t size, bool verbose) {
 
   Atomic::inc(&_total_oracle_alloc_tracked);
 
-  // This is an application allocation - track it with the oracle
-  // Get next per-thread allocation sequence number (1-based)
-  // This also maps the runtime thread to a logical thread ID
-  uint64_t per_thread_seq = _oracle->next_thread_alloc_seq(thread_id);
+  // Extract type FIRST — needed for thread signature matching during map_runtime_to_logical().
+  // The Klass was stored in thread-local data by memAllocator.cpp before calling mem_allocate().
+  const char* alloc_type = nullptr;
+  char normalized_type[128];
+  Klass* klass = EpsilonThreadLocalData::current_alloc_klass(current_thread);
+  if (klass != nullptr) {
+    const char* raw_name = klass->external_name();
+    EpsilonOracle::normalize_type_name(raw_name, normalized_type, sizeof(normalized_type));
+    alloc_type = normalized_type;
+  }
+
+  // Get next per-thread allocation sequence number (1-based).
+  // This also maps the runtime thread to a logical thread ID on first call,
+  // using alloc_type and size_in_bytes for signature-based matching.
+  uint64_t per_thread_seq = _oracle->next_thread_alloc_seq(thread_id, alloc_type, size_in_bytes);
 
   // Get logical thread ID (should be valid since next_thread_alloc_seq just mapped it)
   int32_t logical_thread = _oracle->get_logical_thread(thread_id);
@@ -321,16 +332,6 @@ HeapWord* EpsilonHeap::allocate_work_oracle(size_t size, bool verbose) {
     log_trace(gc)("Oracle: Thread %" PRId64 " not mapped to logical thread", thread_id);
     HeapWord* mem = bump_allocate();
     return mem;
-  }
-
-  // Get the type name for type-keyed matching
-  const char* alloc_type = nullptr;
-  char normalized_type[128];
-  Klass* klass = EpsilonThreadLocalData::current_alloc_klass(current_thread);
-  if (klass != nullptr) {
-    const char* raw_name = klass->external_name();
-    EpsilonOracle::normalize_type_name(raw_name, normalized_type, sizeof(normalized_type));
-    alloc_type = normalized_type;
   }
 
   HeapWord* mem = nullptr;

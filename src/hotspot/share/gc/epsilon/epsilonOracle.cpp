@@ -636,6 +636,11 @@ int32_t EpsilonOracle::map_runtime_to_logical(int64_t runtime_thread_id,
   // --- Check if this thread is in buffering mode (no mapping yet, buffer exists) ---
   size_t buf_idx = ((uint64_t)runtime_thread_id * 2654435761ULL) & (RUNTIME_BUFFER_MAP_SIZE - 1);
   RuntimeThreadBuffer* buffer = _runtime_buffers[buf_idx];
+  if (buffer != nullptr && buffer->runtime_thread_id != runtime_thread_id) {
+    // Hash collision: different thread owns this buffer slot.
+    Atomic::add(&_matching_stats.buffer_collision, (uint64_t)1);
+    buffer = nullptr;
+  }
   if (buffer != nullptr) {
     // Add this allocation to buffer
     if (alloc_type != nullptr && buffer->count < RuntimeThreadBuffer::MAX_BUFFER) {
@@ -719,6 +724,7 @@ int32_t EpsilonOracle::map_runtime_to_logical(int64_t runtime_thread_id,
       // Allocate buffer
       RuntimeThreadBuffer* new_buffer = NEW_C_HEAP_OBJ(RuntimeThreadBuffer, mtGC);
       memset(new_buffer, 0, sizeof(RuntimeThreadBuffer));
+      new_buffer->runtime_thread_id = runtime_thread_id;
       new_buffer->candidate_count = candidate_count;
       for (int i = 0; i < candidate_count && i < (int)MAX_LOGICAL_THREADS; i++) {
         new_buffer->candidates[i] = candidates[i];
@@ -735,21 +741,49 @@ int32_t EpsilonOracle::map_runtime_to_logical(int64_t runtime_thread_id,
       // Return -2 to signal "buffering, allocate without oracle tracking"
       return -2;
     } else {
-      // No first-sig match -> try type-only match
+      // No first-sig match -> buffer with ALL unclaimed oracle threads as candidates
+      int32_t all_candidates[MAX_LOGICAL_THREADS];
+      int all_count = 0;
       for (int32_t t = _skip_start; t < _num_oracle_threads && (size_t)t < MAX_LOGICAL_THREADS; t++) {
-        if (!_thread_signatures[t].claimed &&
-            _thread_signatures[t].count > 0 &&
-            strcmp(_thread_signatures[t].entries[0].type, alloc_type) == 0) {
-          logical_id = t;
-          _thread_signatures[t].claimed = true;
-          Atomic::add(&_matching_stats.immediate_map, (uint64_t)1);
-          log_info(gc)("Oracle: IMMEDIATE_MAP (type-only) runtime thread %" PRId64
-                       " -> logical %d (type=[%s] sig_size=%zu alloc_size=%zu)",
-                       runtime_thread_id, logical_id, alloc_type,
-                       _thread_signatures[t].entries[0].size, alloc_size);
-          break;
+        if (!_thread_signatures[t].claimed && _thread_signatures[t].count > 0) {
+          if (all_count < (int)MAX_LOGICAL_THREADS) {
+            all_candidates[all_count++] = t;
+          }
         }
       }
+
+      if (all_count > 1) {
+        // Multiple unclaimed threads — enter buffering to score after K allocations
+        RuntimeThreadBuffer* new_buffer = NEW_C_HEAP_OBJ(RuntimeThreadBuffer, mtGC);
+        memset(new_buffer, 0, sizeof(RuntimeThreadBuffer));
+        new_buffer->runtime_thread_id = runtime_thread_id;
+        new_buffer->candidate_count = all_count;
+        for (int i = 0; i < all_count && i < (int)MAX_LOGICAL_THREADS; i++) {
+          new_buffer->candidates[i] = all_candidates[i];
+        }
+
+        // Add first allocation to buffer
+        strncpy(new_buffer->buffer[0].type, alloc_type, sizeof(new_buffer->buffer[0].type) - 1);
+        new_buffer->buffer[0].type[sizeof(new_buffer->buffer[0].type) - 1] = '\0';
+        new_buffer->buffer[0].size = alloc_size;
+        new_buffer->count = 1;
+
+        _runtime_buffers[buf_idx] = new_buffer;
+
+        log_info(gc)("Oracle: BUFFERING (no first-sig match) runtime thread %" PRId64
+                     " (%d unclaimed oracle threads) -- will score after %zu allocations",
+                     runtime_thread_id, all_count, (size_t)EpsilonOracleSignatureDepth);
+        return -2;
+      } else if (all_count == 1) {
+        // Only one unclaimed thread — map directly (nothing to score against)
+        logical_id = all_candidates[0];
+        _thread_signatures[logical_id].claimed = true;
+        Atomic::add(&_matching_stats.immediate_map, (uint64_t)1);
+        log_info(gc)("Oracle: IMMEDIATE_MAP (last unclaimed) runtime thread %" PRId64
+                     " -> logical %d (type=[%s] size=%zu)",
+                     runtime_thread_id, logical_id, alloc_type, alloc_size);
+      }
+      // else: all_count == 0, fall through to sequential fallback below
     }
   }
 
@@ -1761,6 +1795,7 @@ void EpsilonOracle::print_stats() const {
   log_info(gc)("    Buffered map:     %" PRIu64, _matching_stats.buffered_map);
   log_info(gc)("    Fallback map:     %" PRIu64, _matching_stats.fallback_map);
   log_info(gc)("    Buffered leaked:  %" PRIu64, _matching_stats.buffered_leaked);
+  log_info(gc)("    Buffer collision: %" PRIu64, _matching_stats.buffer_collision);
 
   uint64_t total_matched = _matching_stats.type_matches +
                            _matching_stats.perfect_matches +
@@ -1886,6 +1921,7 @@ void EpsilonOracle::finalize() {
   log_info(gc)("    Buffered map:   %" PRIu64, _matching_stats.buffered_map);
   log_info(gc)("    Fallback map:   %" PRIu64, _matching_stats.fallback_map);
   log_info(gc)("    Buffered leaked:%" PRIu64, _matching_stats.buffered_leaked);
+  log_info(gc)("    Buf collision:  %" PRIu64, _matching_stats.buffer_collision);
 
   // Verify all tracked allocations were freed
   if (_tracked_alloc_counter == _free_counter) {
