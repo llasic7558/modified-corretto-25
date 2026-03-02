@@ -470,22 +470,52 @@ int EpsilonOracle::score_thread_match(const RuntimeThreadBuffer* buffer, int32_t
   if (oracle_thread < 0 || (size_t)oracle_thread >= MAX_LOGICAL_THREADS) return 0;
   const ThreadMultiSignature& sig = _thread_signatures[oracle_thread];
 
-  int score = 0;
   int compare_depth = (buffer->count < sig.count) ? buffer->count : sig.count;
 
+  // --- Positional scoring: compare element-by-element ---
+  int positional_score = 0;
   for (int i = 0; i < compare_depth; i++) {
     if (strcmp(buffer->buffer[i].type, sig.entries[i].type) == 0) {
       if (buffer->buffer[i].size == sig.entries[i].size) {
-        score += 2;  // Type + size match
+        positional_score += 2;
       } else {
-        score += 1;  // Type-only match
+        positional_score += 1;
       }
     }
   }
-  return score;
+
+  // --- Bag-of-types scoring: multiset intersection (order-independent) ---
+  // For each buffer entry, find an unconsumed oracle sig entry with the same type.
+  // This handles shifted sequences (e.g., extra class-loading allocation at start).
+  bool sig_used[ThreadMultiSignature::MAX_SIG_DEPTH];
+  memset(sig_used, 0, sizeof(sig_used));
+  int bag_score = 0;
+  for (int i = 0; i < compare_depth; i++) {
+    for (int j = 0; j < sig.count; j++) {
+      if (!sig_used[j] && strcmp(buffer->buffer[i].type, sig.entries[j].type) == 0) {
+        sig_used[j] = true;
+        if (buffer->buffer[i].size == sig.entries[j].size) {
+          bag_score += 2;
+        } else {
+          bag_score += 1;
+        }
+        break;
+      }
+    }
+  }
+
+  // Return the higher of positional and bag-of-types scores
+  return (positional_score > bag_score) ? positional_score : bag_score;
 }
 
 int32_t EpsilonOracle::finalize_buffered_mapping(int64_t runtime_thread_id, RuntimeThreadBuffer* buffer) {
+  // Diagnostic: dump buffer contents for debugging thread mapping
+  log_info(gc)("Oracle: BUFFER DUMP for runtime thread %" PRId64 " (count=%d):",
+               runtime_thread_id, buffer->count);
+  for (int d = 0; d < buffer->count && d < 8; d++) {
+    log_info(gc)("Oracle:   buf[%d] type=[%s] size=%zu", d, buffer->buffer[d].type, buffer->buffer[d].size);
+  }
+
   // Score all candidates and pick the best
   int best_score = -1;
   int32_t best_thread = -1;
@@ -721,6 +751,13 @@ int32_t EpsilonOracle::map_runtime_to_logical(int64_t runtime_thread_id,
                    runtime_thread_id, candidate_count, alloc_type, alloc_size,
                    (size_t)EpsilonOracleSignatureDepth);
 
+      // Check for buffer slot collision before creating
+      if (_runtime_buffers[buf_idx] != nullptr) {
+        Atomic::add(&_matching_stats.buffer_collision, (uint64_t)1);
+        // Defer mapping — slot will free when the other thread's buffer is finalized
+        return -2;
+      }
+
       // Allocate buffer
       RuntimeThreadBuffer* new_buffer = NEW_C_HEAP_OBJ(RuntimeThreadBuffer, mtGC);
       memset(new_buffer, 0, sizeof(RuntimeThreadBuffer));
@@ -753,6 +790,13 @@ int32_t EpsilonOracle::map_runtime_to_logical(int64_t runtime_thread_id,
       }
 
       if (all_count > 1) {
+        // Check for buffer slot collision before creating
+        if (_runtime_buffers[buf_idx] != nullptr) {
+          Atomic::add(&_matching_stats.buffer_collision, (uint64_t)1);
+          // Defer mapping — slot will free when the other thread's buffer is finalized
+          return -2;
+        }
+
         // Multiple unclaimed threads — enter buffering to score after K allocations
         RuntimeThreadBuffer* new_buffer = NEW_C_HEAP_OBJ(RuntimeThreadBuffer, mtGC);
         memset(new_buffer, 0, sizeof(RuntimeThreadBuffer));
