@@ -1580,7 +1580,10 @@ bool EpsilonOracle::register_allocation(int64_t runtime_thread_id, void* ptr, si
   if (alloc_site != nullptr && alloc_site[0] != '\0') {
     uint64_t site_max = get_site_max_lifetime(logical_thread, alloc_site);
     if (site_max > 0) {
-      uint64_t target_seq = per_thread_seq + site_max;
+      // Apply 1.1x safety factor to account for replay having ~6-7% more
+      // allocations than the trace (allocation sequence drift)
+      uint64_t safe_lifetime = (uint64_t)((double)site_max * 1.1);
+      uint64_t target_seq = per_thread_seq + safe_lifetime;
 
       // Infrastructure protection
       bool defer = false;
@@ -1627,7 +1630,9 @@ bool EpsilonOracle::register_allocation(int64_t runtime_thread_id, void* ptr, si
   if (alloc_type != nullptr && alloc_type[0] != '\0') {
     uint64_t type_max = get_type_max_lifetime(logical_thread, alloc_type);
     if (type_max > 0) {
-      uint64_t target_seq = per_thread_seq + type_max;
+      // Apply 1.1x safety factor for allocation sequence drift
+      uint64_t safe_lifetime = (uint64_t)((double)type_max * 1.1);
+      uint64_t target_seq = per_thread_seq + safe_lifetime;
 
       // Infrastructure protection
       bool defer = false;
