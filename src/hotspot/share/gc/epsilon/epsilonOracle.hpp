@@ -31,7 +31,7 @@
 #include "utilities/globalDefinitions.hpp"
 
 // Oracle entry from the trace file (per-thread format with LOGICAL thread IDs)
-// Format: alloc_thread,alloc_seq,free_thread,free_seq,size,type,obj_id
+// Format: alloc_thread,alloc_seq,free_thread,free_seq,size,type,obj_id[,alloc_method]
 // (Also supports 9-column format with type_hash and relative_lifetime columns)
 // Thread IDs are LOGICAL (0, 1, 2, ...) based on order of first allocation in trace.
 // At runtime, OS thread IDs are mapped to logical IDs in the same order.
@@ -42,6 +42,9 @@ struct OracleEntry {
   uint64_t free_seq;       // Per-thread sequence at which to free
   size_t   size;           // Object size in bytes
   char     type[128];      // Object type name (for debugging only, not used for matching)
+  char     alloc_method[128]; // Allocating method (class#method), for site validation
+  char     site_key[256];      // Allocation site key (class:method:N)
+  uint64_t site_invocation;    // Nth invocation of this site on this thread
 };
 
 // Delayed-free entry for the delayed-free circular buffer
@@ -109,6 +112,37 @@ struct TypeQueue {
   TypeQueue* next;         // Next in hash chain
 };
 
+// Site-keyed queue node: stores oracle entry + invocation count for site matching
+struct SiteQueueNode {
+  size_t entry_idx;            // Index into _entries array
+  uint64_t site_invocation;    // Which invocation (1, 2, ...) at this site
+  SiteQueueNode* next;
+};
+
+struct SiteQueue {
+  SiteQueueNode* head;
+  SiteQueueNode* tail;
+  size_t count;
+  char site_key[256];          // Site key: "class:method:N"
+  SiteQueue* next;             // Hash chain
+};
+
+// Per-thread site invocation counter (for matching runtime invocations to oracle)
+struct SiteCounter {
+  char site_key[256];
+  uint64_t count;
+  SiteCounter* next;           // Hash chain
+};
+
+// Per-site lifetime aggregate: precomputed during load_trace()
+// Used by SITE_MAX_MATCH and TYPE_MAX_MATCH to schedule deaths safely.
+struct SiteLifetimeInfo {
+  uint64_t max_lifetime;       // Maximum lifetime across all entries at this site
+  uint64_t count;              // Number of entries at this site
+  SiteLifetimeInfo* next;      // Hash chain
+  char site_key[256];          // Site key (deepened) or type name
+};
+
 // Statistics for resilient oracle matching
 struct OracleMatchingStats {
   volatile uint64_t thread0_skipped;     // Thread 0 allocations skipped
@@ -124,11 +158,24 @@ struct OracleMatchingStats {
   volatile uint64_t type_fallback;       // Type not available, fell back to size matching
   volatile uint64_t longlived_leaked;    // Long-lived singletons leaked (lifetime >= 90% of thread entries)
   volatile uint64_t classloader_leaked;  // ClassLoader objects leaked (JVM holds live refs past oracle death)
+  volatile uint64_t thread0_leaked;      // Thread 0 objects leaked (harness/infrastructure protection)
   volatile uint64_t immediate_map;       // Thread mapped on first allocation (unique sig)
   volatile uint64_t buffered_map;        // Thread mapped after K-allocation scoring
   volatile uint64_t fallback_map;        // Thread mapped via sequential fallback
   volatile uint64_t buffered_leaked;     // Allocations leaked during buffering phase
   volatile uint64_t buffer_collision;     // Hash collisions in runtime buffer map
+  volatile uint64_t site_mismatch;       // Type+size matched but allocating method didn't (leaked safely)
+  volatile uint64_t min_lifetime_leaked; // Leaked due to EpsilonOracleMinLifetime guard
+  volatile uint64_t stat_outlier_leaked; // Leaked due to statistical outlier detection
+  volatile uint64_t site_counter_matches;// Matched via (thread, site_key, invocation) 1:1
+  volatile uint64_t site_fifo_matches;   // Matched via site-keyed FIFO (invocation diverged) [LEGACY]
+  volatile uint64_t site_max_matches;    // Matched via per-site max lifetime (replaces FIFO)
+  volatile uint64_t type_max_matches;    // Matched via per-type max lifetime (replaces type FIFO)
+  volatile uint64_t unmatched_leaked;    // No site or type in oracle, leaked safely
+  volatile uint64_t drift_scaled_count;  // Deaths where drift_ratio > 1.01 (lifetime was extended)
+  volatile double   max_drift_ratio;     // Largest drift ratio observed
+  volatile double   sum_drift_ratio;     // Sum of all drift ratios (for average)
+  volatile uint64_t drift_ratio_samples; // Number of drift ratio samples
 };
 
 // Multi-allocation thread signature: records first K allocations per oracle thread
@@ -180,6 +227,22 @@ struct ThreadAllocState {
   // Type-keyed FIFO queues: hash table of type name -> FIFO of oracle entries
   static const size_t TYPE_QUEUE_BUCKETS = 256;
   TypeQueue* type_queues[TYPE_QUEUE_BUCKETS];
+
+  // Per-type lifetime statistics (for statistical outlier detection guard)
+  static const size_t LIFETIME_STAT_BUCKETS = 256;
+  struct LifetimeStat {
+    uint64_t sum;
+    uint64_t count;
+  };
+  LifetimeStat lifetime_stats[LIFETIME_STAT_BUCKETS];
+
+  // Site-keyed FIFO queues: hash table of site_key -> FIFO of oracle entries
+  static const size_t SITE_QUEUE_BUCKETS = 1024;
+  SiteQueue* site_queues[SITE_QUEUE_BUCKETS];
+
+  // Per-site invocation counters (runtime side)
+  static const size_t SITE_COUNTER_BUCKETS = 1024;
+  SiteCounter* site_counters[SITE_COUNTER_BUCKETS];
 };
 
 // Oracle-based memory manager for deterministic malloc/free
@@ -208,6 +271,20 @@ private:
   // Death map: hash table mapping (free_thread, free_seq) -> list of pointers to free
   static const size_t DEATH_MAP_SIZE = 1 << 20;  // 1M buckets
   DeathBucket** _death_map;
+
+  // Per-site max lifetime map (replaces FIFO for death scheduling)
+  static const size_t SITE_LIFETIME_MAP_SIZE = 4096;
+  SiteLifetimeInfo* _site_lifetime_map[SITE_LIFETIME_MAP_SIZE];
+
+  // Per-type max lifetime map (fallback when site not found)
+  SiteLifetimeInfo* _type_lifetime_map[SITE_LIFETIME_MAP_SIZE];
+
+  // Build lifetime maps from loaded entries
+  void build_site_lifetime_maps();
+
+  // Lookup max lifetime for a site key or type name
+  uint64_t get_site_max_lifetime(int32_t logical_thread, const char* site_key) const;
+  uint64_t get_type_max_lifetime(int32_t logical_thread, const char* type_name) const;
 
   // Per-thread allocation state: array indexed by LOGICAL thread ID
   // Direct array access since logical IDs are small (0, 1, 2, ...)
@@ -338,6 +415,12 @@ private:
   // Build type-keyed FIFO queues for each (thread, type) pair
   void build_type_queues();
 
+  // Build site-keyed FIFO queues for each (thread, site_key) pair
+  void build_site_queues();
+
+  // Increment per-thread per-site invocation counter, returns new count
+  uint64_t increment_site_counter(int32_t logical_thread, const char* site_key);
+
   // Hash a type name to a bucket index
   static size_t hash_type_name(const char* type_name);
 
@@ -401,7 +484,10 @@ public:
   // ptr: allocated memory
   // size: size in bytes
   // alloc_type: normalized type name (for type-keyed matching), or nullptr for size-based fallback
-  bool register_allocation(int64_t runtime_thread_id, void* ptr, size_t size, const char* alloc_type = nullptr);
+  bool register_allocation(int64_t runtime_thread_id, void* ptr, size_t size,
+                           const char* alloc_type = nullptr,
+                           const char* alloc_method = nullptr,
+                           const char* alloc_site = nullptr);
 
   // Process all deaths for a specific logical thread at given per-thread sequence
   // Adds freed memory to free list

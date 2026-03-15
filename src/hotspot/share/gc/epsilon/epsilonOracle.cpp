@@ -168,6 +168,7 @@ EpsilonOracle::EpsilonOracle() :
 
   // Initialize matching stats
   memset(&_matching_stats, 0, sizeof(_matching_stats));
+  _matching_stats.max_drift_ratio = 1.0;
 
   // Create mutex for thread-safe access
   _oracle_lock = new Mutex(Mutex::nosafepoint, "EpsilonOracle_lock");
@@ -265,9 +266,15 @@ bool EpsilonOracle::load_trace(const char* path) {
   for (const char* p = line; *p; p++) {
     if (*p == ',') header_commas++;
   }
-  bool is_9col = (header_commas >= 8);
-  log_info(gc)("Oracle: Detected %d-column CSV format (commas=%d)",
-               is_9col ? 9 : 7, header_commas);
+  // Detect: 6 commas = 7 columns, 7 commas = 8 columns (with alloc_method),
+  //         8 commas = 9 columns (legacy), 9 commas = 10 columns (with site_key)
+  bool has_site_key = (header_commas >= 9);    // 10 columns = 9 commas
+  bool is_9col = (header_commas == 8);         // Legacy 9-col format
+  bool has_alloc_method = (header_commas >= 7);
+  log_info(gc)("Oracle: Detected %d-column CSV format (commas=%d)%s%s",
+               header_commas + 1, header_commas,
+               has_alloc_method ? " (with alloc_method)" : "",
+               has_site_key ? " (with site_key)" : "");
 
   // Parse CSV entries using line-based parsing to handle both 7 and 9 column formats.
   // 7-col: alloc_thread,alloc_seq,free_thread,free_seq,size,type,obj_id
@@ -288,13 +295,13 @@ bool EpsilonOracle::load_trace(const char* path) {
     // We need: alloc_thread (0), alloc_seq (1), free_thread (2), free_seq (3), size (4), type (5)
     // For 9-col, fields 6 and 7 (type_hash, relative_lifetime) are skipped; field 8 is obj_id (unused)
     // For 7-col, field 6 is obj_id (unused)
-    char* fields[10];
+    char* fields[12];
     int field_count = 0;
     char* pos = line;
     fields[0] = pos;
     field_count = 1;
 
-    while (*pos && field_count < 10) {
+    while (*pos && field_count < 12) {
       if (*pos == ',') {
         *pos = '\0';
         pos++;
@@ -332,6 +339,26 @@ bool EpsilonOracle::load_trace(const char* path) {
     entry.size = size;
     strncpy(entry.type, type, sizeof(entry.type) - 1);
     entry.type[sizeof(entry.type) - 1] = '\0';
+
+    // Parse alloc_method if present (8-column format: field[7] is alloc_method)
+    // In 9-column format, alloc_method is not present (fields 6-7 are type_hash, relative_lifetime)
+    if (has_alloc_method && !is_9col && field_count >= 8) {
+      strncpy(entry.alloc_method, fields[7], sizeof(entry.alloc_method) - 1);
+      entry.alloc_method[sizeof(entry.alloc_method) - 1] = '\0';
+    } else {
+      entry.alloc_method[0] = '\0';
+    }
+
+    // Parse site_key and site_invocation if present (10-column format: fields[8] and [9])
+    if (has_site_key && field_count >= 10) {
+      strncpy(entry.site_key, fields[8], sizeof(entry.site_key) - 1);
+      entry.site_key[sizeof(entry.site_key) - 1] = '\0';
+      entry.site_invocation = strtoull(fields[9], nullptr, 10);
+    } else {
+      entry.site_key[0] = '\0';
+      entry.site_invocation = 0;
+    }
+
     _entry_count++;
 
     // Track max logical thread ID
@@ -354,6 +381,9 @@ bool EpsilonOracle::load_trace(const char* path) {
     // NOTE: build_type_queues normalizes entry types IN-PLACE, so it MUST run
     // before build_thread_signatures which reads the normalized types.
     build_type_queues();
+    build_site_queues();
+    // Build per-site and per-type max lifetime maps for SITE_MAX_MATCH/TYPE_MAX_MATCH
+    build_site_lifetime_maps();
     // Build first-allocation signatures for content-based thread matching
     // (must run AFTER build_type_queues so types are already normalized)
     build_thread_signatures();
@@ -637,6 +667,155 @@ void EpsilonOracle::build_type_queues() {
 
   log_info(gc)("Oracle: Built %zu type queues with %zu total nodes across %d threads",
                total_queues, total_nodes, _num_oracle_threads);
+}
+
+void EpsilonOracle::build_site_queues() {
+  log_info(gc)("Oracle: Building site-keyed FIFO queues for %zu entries...", _entry_count);
+
+  size_t total_nodes = 0;
+  size_t total_queues = 0;
+
+  for (size_t i = 0; i < _entry_count; i++) {
+    OracleEntry& entry = _entries[i];
+    if (entry.site_key[0] == '\0') continue;  // No site key for this entry
+
+    int32_t logical_thread = entry.alloc_thread;
+    ThreadAllocState* state = get_or_create_thread_state(logical_thread);
+    if (state == nullptr) continue;
+
+    // Hash the site key
+    size_t bucket = 0;
+    for (const char* p = entry.site_key; *p; p++) {
+      bucket = bucket * 31 + (unsigned char)*p;
+    }
+    bucket = bucket % ThreadAllocState::SITE_QUEUE_BUCKETS;
+
+    // Find or create SiteQueue for this site_key
+    SiteQueue* queue = state->site_queues[bucket];
+    while (queue != nullptr && strcmp(queue->site_key, entry.site_key) != 0) {
+      queue = queue->next;
+    }
+    if (queue == nullptr) {
+      queue = NEW_C_HEAP_OBJ(SiteQueue, mtGC);
+      memset(queue, 0, sizeof(SiteQueue));
+      strncpy(queue->site_key, entry.site_key, sizeof(queue->site_key) - 1);
+      queue->site_key[sizeof(queue->site_key) - 1] = '\0';
+      queue->next = state->site_queues[bucket];
+      state->site_queues[bucket] = queue;
+      total_queues++;
+    }
+
+    // Create node and enqueue at FIFO tail
+    SiteQueueNode* node = NEW_C_HEAP_OBJ(SiteQueueNode, mtGC);
+    node->entry_idx = i;
+    node->site_invocation = entry.site_invocation;
+    node->next = nullptr;
+    if (queue->tail != nullptr) {
+      queue->tail->next = node;
+    } else {
+      queue->head = node;
+    }
+    queue->tail = node;
+    queue->count++;
+    total_nodes++;
+  }
+
+  log_info(gc)("Oracle: Built %zu site queues with %zu total nodes",
+               total_queues, total_nodes);
+}
+
+void EpsilonOracle::build_site_lifetime_maps() {
+  log_info(gc)("Oracle: Building per-site lifetime maps for %zu entries...", _entry_count);
+
+  memset(_site_lifetime_map, 0, sizeof(_site_lifetime_map));
+  memset(_type_lifetime_map, 0, sizeof(_type_lifetime_map));
+
+  size_t site_count = 0;
+  size_t type_count = 0;
+
+  for (size_t i = 0; i < _entry_count; i++) {
+    OracleEntry& entry = _entries[i];
+
+    // Only compute lifetime for same-thread frees
+    if (entry.alloc_thread != entry.free_thread) continue;
+    uint64_t lifetime = (entry.free_seq > entry.alloc_seq)
+                        ? (entry.free_seq - entry.alloc_seq) : 1;
+
+    // --- Per-site max ---
+    if (entry.site_key[0] != '\0') {
+      size_t bucket = 0;
+      for (const char* p = entry.site_key; *p; p++) {
+        bucket = bucket * 31 + (unsigned char)*p;
+      }
+      bucket = bucket % SITE_LIFETIME_MAP_SIZE;
+
+      SiteLifetimeInfo* info = _site_lifetime_map[bucket];
+      while (info != nullptr && strcmp(info->site_key, entry.site_key) != 0) {
+        info = info->next;
+      }
+      if (info == nullptr) {
+        info = NEW_C_HEAP_OBJ(SiteLifetimeInfo, mtGC);
+        memset(info, 0, sizeof(SiteLifetimeInfo));
+        strncpy(info->site_key, entry.site_key, sizeof(info->site_key) - 1);
+        info->site_key[sizeof(info->site_key) - 1] = '\0';
+        info->next = _site_lifetime_map[bucket];
+        _site_lifetime_map[bucket] = info;
+        site_count++;
+      }
+      if (lifetime > info->max_lifetime) info->max_lifetime = lifetime;
+      info->count++;
+    }
+
+    // --- Per-type max ---
+    if (entry.type[0] != '\0') {
+      size_t bucket = hash_type_name(entry.type) % SITE_LIFETIME_MAP_SIZE;
+
+      SiteLifetimeInfo* info = _type_lifetime_map[bucket];
+      while (info != nullptr && strcmp(info->site_key, entry.type) != 0) {
+        info = info->next;
+      }
+      if (info == nullptr) {
+        info = NEW_C_HEAP_OBJ(SiteLifetimeInfo, mtGC);
+        memset(info, 0, sizeof(SiteLifetimeInfo));
+        strncpy(info->site_key, entry.type, sizeof(info->site_key) - 1);
+        info->site_key[sizeof(info->site_key) - 1] = '\0';
+        info->next = _type_lifetime_map[bucket];
+        _type_lifetime_map[bucket] = info;
+        type_count++;
+      }
+      if (lifetime > info->max_lifetime) info->max_lifetime = lifetime;
+      info->count++;
+    }
+  }
+
+  log_info(gc)("Oracle: Built %zu site lifetime entries and %zu type lifetime entries",
+               site_count, type_count);
+}
+
+uint64_t EpsilonOracle::get_site_max_lifetime(int32_t logical_thread, const char* site_key) const {
+  if (site_key == nullptr || site_key[0] == '\0') return 0;
+  size_t bucket = 0;
+  for (const char* p = site_key; *p; p++) {
+    bucket = bucket * 31 + (unsigned char)*p;
+  }
+  bucket = bucket % SITE_LIFETIME_MAP_SIZE;
+  SiteLifetimeInfo* info = _site_lifetime_map[bucket];
+  while (info != nullptr) {
+    if (strcmp(info->site_key, site_key) == 0) return info->max_lifetime;
+    info = info->next;
+  }
+  return 0;
+}
+
+uint64_t EpsilonOracle::get_type_max_lifetime(int32_t logical_thread, const char* type_name) const {
+  if (type_name == nullptr || type_name[0] == '\0') return 0;
+  size_t bucket = hash_type_name(type_name) % SITE_LIFETIME_MAP_SIZE;
+  SiteLifetimeInfo* info = _type_lifetime_map[bucket];
+  while (info != nullptr) {
+    if (strcmp(info->site_key, type_name) == 0) return info->max_lifetime;
+    info = info->next;
+  }
+  return 0;
 }
 
 // Map a runtime OS thread ID to a logical thread ID using two-phase
@@ -924,6 +1103,13 @@ ThreadAllocState* EpsilonOracle::get_or_create_thread_state(int32_t logical_thre
   // Initialize type queue hash table
   memset(state->type_queues, 0, sizeof(state->type_queues));
 
+  // Initialize lifetime stats for statistical outlier detection
+  memset(state->lifetime_stats, 0, sizeof(state->lifetime_stats));
+
+  // Initialize site queue and counter hash tables
+  memset(state->site_queues, 0, sizeof(state->site_queues));
+  memset(state->site_counters, 0, sizeof(state->site_counters));
+
   _thread_states[logical_thread] = state;
 
   log_debug(gc)("Oracle: Created state for logical thread %d, first_entry_idx=%zu",
@@ -1060,21 +1246,48 @@ void EpsilonOracle::schedule_death_relative(OracleEntry& entry, void* ptr, size_
   // Schedule object death using the oracle entry's timing information.
   // Two strategies depending on whether free happens on the same or different thread:
 
-  // --- ClassLoader protection ---
-  // Never free ClassLoader objects. The JVM's ClassLoaderDataGraph holds live references
-  // to classloader instances that persist beyond oracle-scheduled death times.
-  // Freeing them causes is_oop() assertion failures during JVM shutdown.
-  // Also protect java.lang.Class objects which participate in class loading metadata.
-  if (entry.type[0] != '\0') {
+  // --- Infrastructure protection: defer to end of program ---
+  // Thread 0 (harness/setup) objects and classloader/infrastructure objects are unsafe to
+  // free during normal execution. Instead of leaking them, schedule their death at the very
+  // end of the program (last allocation on their thread) so they are freed during shutdown.
+  bool defer_to_end = false;
+
+  if (EpsilonOracleNoFreeThread0 && replay_logical_thread == 0) {
+    Atomic::add(&_matching_stats.thread0_leaked, (uint64_t)1);
+    defer_to_end = true;
+  }
+
+  if (!defer_to_end && entry.type[0] != '\0') {
     if (strstr(entry.type, "ClassLoader") != nullptr ||
         strcmp(entry.type, "java.lang.Class") == 0 ||
         strncmp(entry.type, "org.dacapo.", 11) == 0) {
       Atomic::add(&_matching_stats.classloader_leaked, (uint64_t)1);
-      log_info(gc)("Oracle: INFRASTRUCTURE_LEAKED type=[%s] size=%zu ptr=" PTR_FORMAT
-                   " -- infrastructure protection, leak safely",
-                   entry.type, size, p2i(ptr));
-      return;  // Don't schedule death -- leak this object
+      defer_to_end = true;
     }
+  }
+
+  if (defer_to_end) {
+    // Schedule death at UINT64_MAX-1 so it never triggers during normal execution,
+    // but finalize() will drain the death_map and free these objects at JVM shutdown.
+    int32_t death_thread = replay_logical_thread;
+    uint64_t death_seq = UINT64_MAX - 1;
+
+    log_debug(gc)("Oracle: DEFERRED_TO_END type=[%s] size=%zu ptr=" PTR_FORMAT
+                  " thread=%d -- will be freed at finalize",
+                  entry.type, size, p2i(ptr), death_thread);
+
+    {
+      MutexLocker ml(_oracle_lock, Mutex::_no_safepoint_check_flag);
+      size_t bucket_idx = hash_thread_seq(death_thread, death_seq);
+      DeathBucket* bucket = NEW_C_HEAP_OBJ(DeathBucket, mtGC);
+      bucket->logical_thread = death_thread;
+      bucket->seq = death_seq;
+      bucket->ptr = ptr;
+      bucket->size = size;
+      bucket->next = _death_map[bucket_idx];
+      _death_map[bucket_idx] = bucket;
+    }
+    return;
   }
 
   int32_t target_thread;
@@ -1088,6 +1301,43 @@ void EpsilonOracle::schedule_death_relative(OracleEntry& entry, void* ptr, size_
     uint64_t lifetime = (entry.free_seq > entry.alloc_seq)
                         ? (entry.free_seq - entry.alloc_seq)
                         : 1;  // Minimum lifetime of 1 to avoid immediate free
+
+    // Guard 1: Minimum lifetime floor
+    // If the oracle entry's lifetime is suspiciously short, it may be a wrong
+    // FIFO match (a temp object's entry assigned to a long-lived object).
+    if (EpsilonOracleMinLifetime > 0 && lifetime < (uint64_t)EpsilonOracleMinLifetime) {
+      Atomic::add(&_matching_stats.min_lifetime_leaked, (uint64_t)1);
+      log_debug(gc)("Oracle: MIN_LIFETIME_LEAKED type=[%s] size=%zu"
+                     " lifetime=%" PRIu64 " < min=%zu"
+                     " ptr=" PTR_FORMAT " thread=%d seq=%" PRIu64,
+                     entry.type, size, lifetime, EpsilonOracleMinLifetime,
+                     p2i(ptr), replay_logical_thread, replay_alloc_seq);
+      return;  // Leak safely
+    }
+
+    // Guard 2: Statistical outlier detection
+    // If we've seen 100+ matches for this type and this lifetime is <10% of average,
+    // it's likely a wrong FIFO match (temp object's entry assigned to long-lived object).
+    if (entry.type[0] != '\0') {
+      size_t stat_bucket = hash_type_name(entry.type);
+      ThreadAllocState* state = (replay_logical_thread >= 0 && (size_t)replay_logical_thread < MAX_LOGICAL_THREADS)
+                                ? _thread_states[replay_logical_thread] : nullptr;
+      if (state != nullptr) {
+        ThreadAllocState::LifetimeStat& ls = state->lifetime_stats[stat_bucket];
+        if (ls.count >= 100) {
+          uint64_t avg = ls.sum / ls.count;
+          if (avg > 0 && lifetime * 10 < avg) {
+            Atomic::add(&_matching_stats.stat_outlier_leaked, (uint64_t)1);
+            log_debug(gc)("Oracle: STAT_OUTLIER_LEAKED type=[%s] lifetime=%" PRIu64
+                          " avg=%" PRIu64 " (%.1f%% of avg)",
+                          entry.type, lifetime, avg, (double)lifetime * 100.0 / avg);
+            return;  // Leak safely
+          }
+        }
+        ls.sum += lifetime;
+        ls.count++;
+      }
+    }
 
     // --- FIX A: Detect and leak long-lived singleton objects ---
     // Objects whose lifetime spans >= 90% of the oracle thread's total entries
@@ -1114,7 +1364,45 @@ void EpsilonOracle::schedule_death_relative(OracleEntry& entry, void* ptr, size_
     }
 
     target_thread = replay_logical_thread;
-    target_seq = replay_alloc_seq + lifetime + EpsilonOracleGlobalDelta;
+
+    // --- Adaptive lifetime scaling ---
+    // Replay may have more allocations than the oracle (extra JVM-internal
+    // allocations, constructor order differences, site mismatches, etc.).
+    // Scale the oracle lifetime by the observed divergence ratio so that
+    // the scheduled death maps to the correct point in replay time.
+    //   drift_ratio = replay_alloc_seq / oracle_alloc_seq
+    // A ratio of 1.067 means replay has 6.7% more allocations, so a
+    // lifetime of 35,764 oracle-allocations becomes ~38,160 replay-allocations.
+    double drift_ratio = 1.0;
+    if (entry.alloc_seq > 0) {
+      drift_ratio = (double)replay_alloc_seq / (double)entry.alloc_seq;
+      if (drift_ratio < 1.0) drift_ratio = 1.0;  // Never shrink lifetimes
+    }
+    // Safety factor: global drift ratio captures average divergence, but local
+    // divergence can spike higher. Apply 1.2x safety margin to prevent premature
+    // frees at local divergence peaks.
+    double safe_drift = drift_ratio * 1.2;
+    uint64_t adjusted_lifetime = (uint64_t)((double)lifetime * safe_drift);
+    if (adjusted_lifetime < lifetime) adjusted_lifetime = lifetime;  // Overflow guard
+
+    // Track drift statistics
+    _matching_stats.sum_drift_ratio += drift_ratio;
+    Atomic::add(&_matching_stats.drift_ratio_samples, (uint64_t)1);
+    if (drift_ratio > _matching_stats.max_drift_ratio) {
+      _matching_stats.max_drift_ratio = drift_ratio;  // Benign race -- worst case we miss an update
+    }
+    if (drift_ratio > 1.01) {
+      Atomic::add(&_matching_stats.drift_scaled_count, (uint64_t)1);
+      if (EpsilonOracleVerboseTracking) {
+        log_info(gc)("Oracle: DRIFT_SCALED type=[%s] oracle_seq=%" PRIu64
+                     " replay_seq=%" PRIu64 " ratio=%.3f lifetime=%" PRIu64
+                     " adjusted=%" PRIu64,
+                     entry.type, entry.alloc_seq, replay_alloc_seq,
+                     drift_ratio, lifetime, adjusted_lifetime);
+      }
+    }
+
+    target_seq = replay_alloc_seq + adjusted_lifetime + EpsilonOracleGlobalDelta;
 
     // --- FIX B: Hard cap -- never schedule death beyond oracle horizon ---
     // If the computed target_seq exceeds the replay thread's current sequence
@@ -1230,9 +1518,41 @@ void EpsilonOracle::update_lifetime_stats(ThreadAllocState* state, OracleEntry& 
   }
 }
 
-// --- Core allocation registration with type-keyed matching ---
+// --- Site invocation counter ---
 
-bool EpsilonOracle::register_allocation(int64_t runtime_thread_id, void* ptr, size_t size, const char* alloc_type) {
+uint64_t EpsilonOracle::increment_site_counter(int32_t logical_thread, const char* site_key) {
+  ThreadAllocState* state = (logical_thread >= 0 && (size_t)logical_thread < MAX_LOGICAL_THREADS)
+                            ? _thread_states[logical_thread] : nullptr;
+  if (state == nullptr || site_key == nullptr) return 0;
+
+  // Hash the site key
+  size_t bucket = 0;
+  for (const char* p = site_key; *p; p++) {
+    bucket = bucket * 31 + (unsigned char)*p;
+  }
+  bucket = bucket % ThreadAllocState::SITE_COUNTER_BUCKETS;
+
+  // Find or create counter
+  SiteCounter* counter = state->site_counters[bucket];
+  while (counter != nullptr && strcmp(counter->site_key, site_key) != 0) {
+    counter = counter->next;
+  }
+  if (counter == nullptr) {
+    counter = NEW_C_HEAP_OBJ(SiteCounter, mtGC);
+    strncpy(counter->site_key, site_key, sizeof(counter->site_key) - 1);
+    counter->site_key[sizeof(counter->site_key) - 1] = '\0';
+    counter->count = 0;
+    counter->next = state->site_counters[bucket];
+    state->site_counters[bucket] = counter;
+  }
+  return ++counter->count;
+}
+
+// --- Core allocation registration with three-layer matching ---
+
+bool EpsilonOracle::register_allocation(int64_t runtime_thread_id, void* ptr, size_t size,
+                                        const char* alloc_type, const char* alloc_method,
+                                        const char* alloc_site) {
   // Map runtime thread to logical thread
   int32_t logical_thread = get_logical_thread(runtime_thread_id);
   if (logical_thread < 0) {
@@ -1253,7 +1573,141 @@ bool EpsilonOracle::register_allocation(int64_t runtime_thread_id, void* ptr, si
   // Type-keyed FIFO handles divergence via TYPE_EXHAUSTED (leak safely).
 
   // ============================================================
-  // Type-keyed FIFO matching (primary path when type is available)
+  // LAYER 1 + 2: Site-keyed matching (when site key is available)
+  // ============================================================
+  if (alloc_site != nullptr && alloc_site[0] != '\0') {
+    uint64_t site_invocation = increment_site_counter(logical_thread, alloc_site);
+
+    // Hash the site key
+    size_t site_bucket = 0;
+    for (const char* p = alloc_site; *p; p++) {
+      site_bucket = site_bucket * 31 + (unsigned char)*p;
+    }
+    site_bucket = site_bucket % ThreadAllocState::SITE_QUEUE_BUCKETS;
+
+    SiteQueue* sq = state->site_queues[site_bucket];
+    while (sq != nullptr && strcmp(sq->site_key, alloc_site) != 0) {
+      sq = sq->next;
+    }
+
+    if (sq != nullptr && sq->head != nullptr) {
+      // Layer 1: Try exact invocation counter match
+      SiteQueueNode* prev = nullptr;
+      SiteQueueNode* node = sq->head;
+      SiteQueueNode* matched_node = nullptr;
+      SiteQueueNode* matched_prev = nullptr;
+      int scan_count = 0;
+
+      while (node != nullptr && scan_count < (int)EpsilonOracleLookahead) {
+        if (node->site_invocation == site_invocation) {
+          OracleEntry& candidate = _entries[node->entry_idx];
+          // Must match size AND type. Same-site allocations can alternate between
+          // different types of the same size (e.g. FastCharStream vs JJCalls[], both 48B).
+          // Without type validation, a short-lived entry can be assigned to a long-lived object.
+          if (candidate.size == size &&
+              (alloc_type == nullptr || candidate.type[0] == '\0' ||
+               strcmp(candidate.type, alloc_type) == 0)) {
+            matched_node = node;
+            matched_prev = prev;
+            break;
+          }
+        }
+        prev = node;
+        node = node->next;
+        scan_count++;
+      }
+
+      if (matched_node != nullptr) {
+        // SITE_COUNTER_MATCH: exact 1:1 match (site + invocation + size + type)
+        OracleEntry& entry = _entries[matched_node->entry_idx];
+
+        // Remove from FIFO
+        if (matched_prev != nullptr) {
+          matched_prev->next = matched_node->next;
+        } else {
+          sq->head = matched_node->next;
+        }
+        if (sq->tail == matched_node) {
+          sq->tail = matched_prev;
+        }
+        sq->count--;
+        FREE_C_HEAP_OBJ(matched_node);
+
+        update_lifetime_stats(state, entry);
+        schedule_death_relative(entry, ptr, size, logical_thread, per_thread_seq);
+
+        Atomic::add(&_matching_stats.site_counter_matches, (uint64_t)1);
+        Atomic::add(&_tracked_alloc_counter, (uint64_t)1);
+        Atomic::add(&_allocated_bytes, size);
+
+        log_info(gc)("Oracle: SITE_COUNTER_MATCH logical_thread=%d seq=%" PRIu64
+                     " site=[%s] invocation=%" PRIu64 " size=%zu ptr=" PTR_FORMAT,
+                     logical_thread, per_thread_seq, alloc_site,
+                     site_invocation, size, p2i(ptr));
+        return true;
+      }
+
+      // Layer 2: Site FIFO scan (counter missed, try any entry with matching size)
+      prev = nullptr;
+      node = sq->head;
+      matched_node = nullptr;
+      matched_prev = nullptr;
+      scan_count = 0;
+
+      while (node != nullptr && scan_count < (int)EpsilonOracleLookahead) {
+        OracleEntry& candidate = _entries[node->entry_idx];
+        if (candidate.size == size &&
+            (alloc_type == nullptr || candidate.type[0] == '\0' ||
+             strcmp(candidate.type, alloc_type) == 0)) {
+          matched_node = node;
+          matched_prev = prev;
+          break;
+        }
+        prev = node;
+        node = node->next;
+        scan_count++;
+      }
+
+      if (matched_node != nullptr) {
+        // SITE_FIFO_MATCH: site matched, correct size + type, but invocation counter diverged
+        OracleEntry& entry = _entries[matched_node->entry_idx];
+        uint64_t oracle_invocation = matched_node->site_invocation;  // Save before free
+
+        // Remove from FIFO
+        if (matched_prev != nullptr) {
+          matched_prev->next = matched_node->next;
+        } else {
+          sq->head = matched_node->next;
+        }
+        if (sq->tail == matched_node) {
+          sq->tail = matched_prev;
+        }
+        sq->count--;
+        FREE_C_HEAP_OBJ(matched_node);
+
+        update_lifetime_stats(state, entry);
+        schedule_death_relative(entry, ptr, size, logical_thread, per_thread_seq);
+
+        Atomic::add(&_matching_stats.site_fifo_matches, (uint64_t)1);
+        Atomic::add(&_tracked_alloc_counter, (uint64_t)1);
+        Atomic::add(&_allocated_bytes, size);
+
+        log_info(gc)("Oracle: SITE_FIFO_MATCH logical_thread=%d seq=%" PRIu64
+                     " site=[%s] invocation=%" PRIu64 " (oracle_invocation=%" PRIu64
+                     ") size=%zu ptr=" PTR_FORMAT,
+                     logical_thread, per_thread_seq, alloc_site,
+                     site_invocation, oracle_invocation,
+                     size, p2i(ptr));
+        return true;
+      }
+
+      // Site queue exists but no size match — fall through to Layer 3 (type FIFO)
+    }
+    // Site queue doesn't exist or is empty — fall through to Layer 3
+  }
+
+  // ============================================================
+  // LAYER 3: Type-keyed FIFO matching (fallback when site unavailable or missed)
   // ============================================================
   if (alloc_type != nullptr && alloc_type[0] != '\0') {
     size_t bucket = hash_type_name(alloc_type);
@@ -1279,18 +1733,29 @@ bool EpsilonOracle::register_allocation(int64_t runtime_thread_id, void* ptr, si
       while (node != nullptr && scan_count < scan_limit) {
         OracleEntry& candidate = _entries[node->entry_idx];
         if (candidate.size == size) {
-          // Found type+size match -- remove from FIFO
-          matched_node = node;
-          if (prev == nullptr) {
-            queue->head = node->next;
-          } else {
-            prev->next = node->next;
+          // Size matches. Now validate allocating method if available.
+          bool method_ok = true;
+          if (EpsilonOracleValidateSite &&
+              alloc_method != nullptr && alloc_method[0] != '\0' &&
+              candidate.alloc_method[0] != '\0') {
+            method_ok = (strcmp(candidate.alloc_method, alloc_method) == 0);
           }
-          if (queue->tail == node) {
-            queue->tail = prev;
+
+          if (method_ok) {
+            // Found type+size+method match -- remove from FIFO
+            matched_node = node;
+            if (prev == nullptr) {
+              queue->head = node->next;
+            } else {
+              prev->next = node->next;
+            }
+            if (queue->tail == node) {
+              queue->tail = prev;
+            }
+            queue->count--;
+            break;
           }
-          queue->count--;
-          break;
+          // Size matched but method didn't -- skip this entry, keep scanning
         }
         prev = node;
         node = node->next;
@@ -1308,16 +1773,39 @@ bool EpsilonOracle::register_allocation(int64_t runtime_thread_id, void* ptr, si
         Atomic::add(&_allocated_bytes, size);
 
         log_info(gc)("Oracle: TYPE_MATCH logical_thread=%d seq=%" PRIu64 " type=[%s] size=%zu ptr=" PTR_FORMAT
-                     " -> free at logical_thread=%d seq=%" PRIu64 " (scanned %d)",
+                     " -> free at logical_thread=%d seq=%" PRIu64 " (scanned %d) method=[%s] oracle_method=[%s]",
                      logical_thread, per_thread_seq, alloc_type, size, p2i(ptr),
-                     entry.free_thread, entry.free_seq, scan_count);
+                     entry.free_thread, entry.free_seq, scan_count,
+                     (alloc_method ? alloc_method : ""),
+                     entry.alloc_method);
 
         FREE_C_HEAP_OBJ(matched_node);
         return true;
       }
 
-      // Type matched but no size match within lookahead -- leak safely.
-      // The oracle entry is for a different-sized object of the same type.
+      // No match found within lookahead. Could be size mismatch or site mismatch.
+      // Check if any size-matched entry was rejected due to method validation:
+      if (EpsilonOracleValidateSite && alloc_method != nullptr && alloc_method[0] != '\0') {
+        TypeQueueNode* check = queue->head;
+        int check_count = 0;
+        bool had_size_match = false;
+        while (check != nullptr && check_count < scan_limit) {
+          OracleEntry& c = _entries[check->entry_idx];
+          if (c.size == size) { had_size_match = true; break; }
+          check = check->next;
+          check_count++;
+        }
+        if (had_size_match) {
+          Atomic::add(&_matching_stats.site_mismatch, (uint64_t)1);
+          log_debug(gc)("Oracle: SITE_MISMATCH logical_thread=%d seq=%" PRIu64
+                        " type=[%s] size=%zu method=[%s] ptr=" PTR_FORMAT
+                        " (type+size matched but method didn't - leak safely)",
+                        logical_thread, per_thread_seq, alloc_type, size,
+                        alloc_method, p2i(ptr));
+          return false;
+        }
+      }
+      // No size match at all
       Atomic::add(&_matching_stats.type_size_mismatch, (uint64_t)1);
 
       log_debug(gc)("Oracle: TYPE_SIZE_MISMATCH logical_thread=%d seq=%" PRIu64 " type=[%s] size=%zu ptr=" PTR_FORMAT
@@ -1826,6 +2314,7 @@ void EpsilonOracle::print_stats() const {
   log_info(gc)("    Type matches:     %" PRIu64, _matching_stats.type_matches);
   log_info(gc)("    Type exhausted:   %" PRIu64, _matching_stats.type_exhausted);
   log_info(gc)("    Type size mism:   %" PRIu64, _matching_stats.type_size_mismatch);
+  log_info(gc)("    Site mismatch:    %" PRIu64, _matching_stats.site_mismatch);
   log_info(gc)("    Type fallback:    %" PRIu64, _matching_stats.type_fallback);
   log_info(gc)("    Perfect matches:  %" PRIu64, _matching_stats.perfect_matches);
   log_info(gc)("    Lookahead matches:%" PRIu64, _matching_stats.lookahead_matches);
@@ -1958,6 +2447,21 @@ void EpsilonOracle::finalize() {
   log_info(gc)("    Exhausted:      %" PRIu64, _matching_stats.oracle_exhausted);
   log_info(gc)("    Long-lived leak:%" PRIu64, _matching_stats.longlived_leaked);
   log_info(gc)("    Classloader leak:%" PRIu64, _matching_stats.classloader_leaked);
+  log_info(gc)("    Thread0 leak:   %" PRIu64, _matching_stats.thread0_leaked);
+  log_info(gc)("    Site ctr match: %" PRIu64, _matching_stats.site_counter_matches);
+  log_info(gc)("    Site FIFO match:%" PRIu64, _matching_stats.site_fifo_matches);
+  log_info(gc)("    Min life leaked:%" PRIu64, _matching_stats.min_lifetime_leaked);
+  log_info(gc)("    Stat outlier:   %" PRIu64, _matching_stats.stat_outlier_leaked);
+  log_info(gc)("    Site mismatch:  %" PRIu64, _matching_stats.site_mismatch);
+  // Drift scaling stats
+  log_info(gc)("  Drift scaling:");
+  log_info(gc)("    Drift scaled:   %" PRIu64, _matching_stats.drift_scaled_count);
+  log_info(gc)("    Max drift ratio:%.4f", _matching_stats.max_drift_ratio);
+  if (_matching_stats.drift_ratio_samples > 0) {
+    log_info(gc)("    Avg drift ratio:%.4f",
+                 _matching_stats.sum_drift_ratio / (double)_matching_stats.drift_ratio_samples);
+  }
+  log_info(gc)("    Drift samples:  %" PRIu64, _matching_stats.drift_ratio_samples);
   // Print TYPE_EXHAUSTED diagnostic breakdown
   print_type_exhausted_diag();
   log_info(gc)("  Thread mapping:");
