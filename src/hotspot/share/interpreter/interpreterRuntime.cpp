@@ -256,7 +256,9 @@ static const char* site_key_method_name(Method* m, char* buf, size_t buf_size) {
 // Append caller info to site_key: "Class:method:N" → "Class:method:N@CallerClass:callerMethod"
 // Walks one frame up via java_sender() to get the calling method.
 static void append_caller_to_site_key(LastFrameAccessor& last_frame, char* site_key, size_t site_key_size) {
-  frame caller_frame = last_frame.get_frame().java_sender();
+  frame f = last_frame.get_frame();
+  if (f.is_first_java_frame()) return;  // No caller frame available
+  frame caller_frame = f.java_sender();
   if (caller_frame.is_interpreted_frame()) {
     Method* caller = caller_frame.interpreter_frame_method();
     const char* caller_class = caller->method_holder()->external_name();
