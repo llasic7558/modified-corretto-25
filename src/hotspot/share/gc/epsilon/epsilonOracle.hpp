@@ -135,12 +135,15 @@ struct SiteCounter {
 };
 
 // Per-site lifetime aggregate: precomputed during load_trace()
-// Used by SITE_MAX_MATCH and TYPE_MAX_MATCH to schedule deaths safely.
+// Uses P99 lifetime instead of max to avoid extreme outliers inflating death times.
 struct SiteLifetimeInfo {
-  uint64_t max_lifetime;       // Maximum lifetime across all entries at this site
+  uint64_t max_lifetime;       // P99 lifetime (99th percentile) across entries at this site
   uint64_t count;              // Number of entries at this site
   SiteLifetimeInfo* next;      // Hash chain
   char site_key[256];          // Site key (deepened) or type name
+  // Temporary fields used during build_site_lifetime_maps(), freed after
+  uint64_t* tmp_lifetimes;     // Array of all lifetimes (for sorting/P99)
+  size_t tmp_fill;             // Current fill position
 };
 
 // Statistics for resilient oracle matching

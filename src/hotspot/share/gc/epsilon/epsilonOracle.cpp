@@ -724,8 +724,72 @@ void EpsilonOracle::build_site_queues() {
                total_queues, total_nodes);
 }
 
+// Helper: find or create a SiteLifetimeInfo in a hash map
+static SiteLifetimeInfo* find_or_create_lifetime_info(
+    SiteLifetimeInfo** map, size_t map_size, const char* key, size_t& out_count) {
+  size_t bucket = 0;
+  for (const char* p = key; *p; p++) {
+    bucket = bucket * 31 + (unsigned char)*p;
+  }
+  bucket = bucket % map_size;
+
+  SiteLifetimeInfo* info = map[bucket];
+  while (info != nullptr && strcmp(info->site_key, key) != 0) {
+    info = info->next;
+  }
+  if (info == nullptr) {
+    info = NEW_C_HEAP_OBJ(SiteLifetimeInfo, mtGC);
+    memset(info, 0, sizeof(SiteLifetimeInfo));
+    strncpy(info->site_key, key, sizeof(info->site_key) - 1);
+    info->site_key[sizeof(info->site_key) - 1] = '\0';
+    info->next = map[bucket];
+    map[bucket] = info;
+    out_count++;
+  }
+  return info;
+}
+
+// Helper: compute P99 for a SiteLifetimeInfo and free temp array
+static void compute_p99_and_cleanup(SiteLifetimeInfo* info) {
+  if (info->tmp_lifetimes == nullptr || info->tmp_fill == 0) {
+    info->max_lifetime = 0;
+    return;
+  }
+  // Sort lifetimes
+  size_t n = info->tmp_fill;
+  uint64_t* arr = info->tmp_lifetimes;
+  // Simple insertion sort for small arrays, qsort for large
+  if (n <= 64) {
+    for (size_t i = 1; i < n; i++) {
+      uint64_t key = arr[i];
+      size_t j = i;
+      while (j > 0 && arr[j-1] > key) {
+        arr[j] = arr[j-1];
+        j--;
+      }
+      arr[j] = key;
+    }
+  } else {
+    // Use stdlib qsort
+    qsort(arr, n, sizeof(uint64_t), [](const void* a, const void* b) -> int {
+      uint64_t va = *(const uint64_t*)a;
+      uint64_t vb = *(const uint64_t*)b;
+      return (va > vb) - (va < vb);
+    });
+  }
+
+  // P99: take the 99th percentile
+  size_t p99_idx = (n > 100) ? (size_t)(n * 99 / 100) : (n - 1);
+  info->max_lifetime = arr[p99_idx];
+
+  // Free temp array
+  FREE_C_HEAP_ARRAY(uint64_t, info->tmp_lifetimes);
+  info->tmp_lifetimes = nullptr;
+  info->tmp_fill = 0;
+}
+
 void EpsilonOracle::build_site_lifetime_maps() {
-  log_info(gc)("Oracle: Building per-site lifetime maps for %zu entries...", _entry_count);
+  log_info(gc)("Oracle: Building per-site P99 lifetime maps for %zu entries...", _entry_count);
 
   memset(_site_lifetime_map, 0, sizeof(_site_lifetime_map));
   memset(_type_lifetime_map, 0, sizeof(_type_lifetime_map));
@@ -733,43 +797,19 @@ void EpsilonOracle::build_site_lifetime_maps() {
   size_t site_count = 0;
   size_t type_count = 0;
 
+  // Pass 1: Count entries per site/type
   for (size_t i = 0; i < _entry_count; i++) {
     OracleEntry& entry = _entries[i];
-
-    // Only compute lifetime for same-thread frees
     if (entry.alloc_thread != entry.free_thread) continue;
-    uint64_t lifetime = (entry.free_seq > entry.alloc_seq)
-                        ? (entry.free_seq - entry.alloc_seq) : 1;
 
-    // --- Per-site max ---
     if (entry.site_key[0] != '\0') {
-      size_t bucket = 0;
-      for (const char* p = entry.site_key; *p; p++) {
-        bucket = bucket * 31 + (unsigned char)*p;
-      }
-      bucket = bucket % SITE_LIFETIME_MAP_SIZE;
-
-      SiteLifetimeInfo* info = _site_lifetime_map[bucket];
-      while (info != nullptr && strcmp(info->site_key, entry.site_key) != 0) {
-        info = info->next;
-      }
-      if (info == nullptr) {
-        info = NEW_C_HEAP_OBJ(SiteLifetimeInfo, mtGC);
-        memset(info, 0, sizeof(SiteLifetimeInfo));
-        strncpy(info->site_key, entry.site_key, sizeof(info->site_key) - 1);
-        info->site_key[sizeof(info->site_key) - 1] = '\0';
-        info->next = _site_lifetime_map[bucket];
-        _site_lifetime_map[bucket] = info;
-        site_count++;
-      }
-      if (lifetime > info->max_lifetime) info->max_lifetime = lifetime;
+      SiteLifetimeInfo* info = find_or_create_lifetime_info(
+          _site_lifetime_map, SITE_LIFETIME_MAP_SIZE, entry.site_key, site_count);
       info->count++;
     }
-
-    // --- Per-type max ---
     if (entry.type[0] != '\0') {
       size_t bucket = hash_type_name(entry.type) % SITE_LIFETIME_MAP_SIZE;
-
+      // Use find_or_create but with type hash for bucket
       SiteLifetimeInfo* info = _type_lifetime_map[bucket];
       while (info != nullptr && strcmp(info->site_key, entry.type) != 0) {
         info = info->next;
@@ -783,12 +823,71 @@ void EpsilonOracle::build_site_lifetime_maps() {
         _type_lifetime_map[bucket] = info;
         type_count++;
       }
-      if (lifetime > info->max_lifetime) info->max_lifetime = lifetime;
       info->count++;
     }
   }
 
-  log_info(gc)("Oracle: Built %zu site lifetime entries and %zu type lifetime entries",
+  // Pass 2: Allocate lifetime arrays
+  for (size_t b = 0; b < SITE_LIFETIME_MAP_SIZE; b++) {
+    for (SiteLifetimeInfo* info = _site_lifetime_map[b]; info != nullptr; info = info->next) {
+      if (info->count > 0) {
+        info->tmp_lifetimes = NEW_C_HEAP_ARRAY(uint64_t, info->count, mtGC);
+        info->tmp_fill = 0;
+      }
+    }
+    for (SiteLifetimeInfo* info = _type_lifetime_map[b]; info != nullptr; info = info->next) {
+      if (info->count > 0) {
+        info->tmp_lifetimes = NEW_C_HEAP_ARRAY(uint64_t, info->count, mtGC);
+        info->tmp_fill = 0;
+      }
+    }
+  }
+
+  // Pass 3: Fill lifetime arrays
+  for (size_t i = 0; i < _entry_count; i++) {
+    OracleEntry& entry = _entries[i];
+    if (entry.alloc_thread != entry.free_thread) continue;
+    uint64_t lifetime = (entry.free_seq > entry.alloc_seq)
+                        ? (entry.free_seq - entry.alloc_seq) : 1;
+
+    if (entry.site_key[0] != '\0') {
+      size_t bucket = 0;
+      for (const char* p = entry.site_key; *p; p++) {
+        bucket = bucket * 31 + (unsigned char)*p;
+      }
+      bucket = bucket % SITE_LIFETIME_MAP_SIZE;
+      SiteLifetimeInfo* info = _site_lifetime_map[bucket];
+      while (info != nullptr && strcmp(info->site_key, entry.site_key) != 0) {
+        info = info->next;
+      }
+      if (info != nullptr && info->tmp_lifetimes != nullptr && info->tmp_fill < info->count) {
+        info->tmp_lifetimes[info->tmp_fill++] = lifetime;
+      }
+    }
+
+    if (entry.type[0] != '\0') {
+      size_t bucket = hash_type_name(entry.type) % SITE_LIFETIME_MAP_SIZE;
+      SiteLifetimeInfo* info = _type_lifetime_map[bucket];
+      while (info != nullptr && strcmp(info->site_key, entry.type) != 0) {
+        info = info->next;
+      }
+      if (info != nullptr && info->tmp_lifetimes != nullptr && info->tmp_fill < info->count) {
+        info->tmp_lifetimes[info->tmp_fill++] = lifetime;
+      }
+    }
+  }
+
+  // Pass 4: Compute P99 and free temp arrays
+  for (size_t b = 0; b < SITE_LIFETIME_MAP_SIZE; b++) {
+    for (SiteLifetimeInfo* info = _site_lifetime_map[b]; info != nullptr; info = info->next) {
+      compute_p99_and_cleanup(info);
+    }
+    for (SiteLifetimeInfo* info = _type_lifetime_map[b]; info != nullptr; info = info->next) {
+      compute_p99_and_cleanup(info);
+    }
+  }
+
+  log_info(gc)("Oracle: Built %zu site P99 lifetime entries and %zu type P99 lifetime entries",
                site_count, type_count);
 }
 
