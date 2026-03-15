@@ -1573,144 +1573,16 @@ bool EpsilonOracle::register_allocation(int64_t runtime_thread_id, void* ptr, si
   // Type-keyed FIFO handles divergence via TYPE_EXHAUSTED (leak safely).
 
   // ============================================================
-  // LAYER 1 + 2: Site-keyed matching (when site key is available)
+  // LAYER 1: SITE_MAX_MATCH — per-site max lifetime (no FIFO)
   // ============================================================
-  if (alloc_site != nullptr && alloc_site[0] != '\0') {
-    uint64_t site_invocation = increment_site_counter(logical_thread, alloc_site);
-
-    // Hash the site key
-    size_t site_bucket = 0;
-    for (const char* p = alloc_site; *p; p++) {
-      site_bucket = site_bucket * 31 + (unsigned char)*p;
-    }
-    site_bucket = site_bucket % ThreadAllocState::SITE_QUEUE_BUCKETS;
-
-    SiteQueue* sq = state->site_queues[site_bucket];
-    while (sq != nullptr && strcmp(sq->site_key, alloc_site) != 0) {
-      sq = sq->next;
-    }
-
-    if (sq != nullptr && sq->head != nullptr) {
-      // Layer 1: Try exact invocation counter match
-      SiteQueueNode* prev = nullptr;
-      SiteQueueNode* node = sq->head;
-      SiteQueueNode* matched_node = nullptr;
-      SiteQueueNode* matched_prev = nullptr;
-      int scan_count = 0;
-
-      while (node != nullptr && scan_count < (int)EpsilonOracleLookahead) {
-        if (node->site_invocation == site_invocation) {
-          OracleEntry& candidate = _entries[node->entry_idx];
-          // Must match size AND type. Same-site allocations can alternate between
-          // different types of the same size (e.g. FastCharStream vs JJCalls[], both 48B).
-          // Without type validation, a short-lived entry can be assigned to a long-lived object.
-          if (candidate.size == size &&
-              (alloc_type == nullptr || candidate.type[0] == '\0' ||
-               strcmp(candidate.type, alloc_type) == 0)) {
-            matched_node = node;
-            matched_prev = prev;
-            break;
-          }
-        }
-        prev = node;
-        node = node->next;
-        scan_count++;
-      }
-
-      if (matched_node != nullptr) {
-        // SITE_COUNTER_MATCH: exact 1:1 match (site + invocation + size + type)
-        // Use per-site max lifetime for safety (even exact matches can have
-        // wrong lifetimes due to sequence drift between trace and replay)
-        OracleEntry& entry = _entries[matched_node->entry_idx];
-
-        // Remove from FIFO
-        if (matched_prev != nullptr) {
-          matched_prev->next = matched_node->next;
-        } else {
-          sq->head = matched_node->next;
-        }
-        if (sq->tail == matched_node) {
-          sq->tail = matched_prev;
-        }
-        sq->count--;
-        FREE_C_HEAP_OBJ(matched_node);
-
-        // Use per-site max lifetime instead of entry's exact lifetime
-        uint64_t site_max = get_site_max_lifetime(logical_thread, alloc_site);
-        if (site_max == 0) {
-          // Fallback: compute from entry
-          site_max = (entry.free_seq > entry.alloc_seq) ? (entry.free_seq - entry.alloc_seq) : 1;
-        }
-        uint64_t target_seq = per_thread_seq + site_max;
-
-        // Infrastructure protection
-        bool defer = false;
-        if (EpsilonOracleNoFreeThread0 && logical_thread == 0) {
-          Atomic::add(&_matching_stats.thread0_leaked, (uint64_t)1);
-          defer = true;
-        }
-        if (!defer && alloc_type != nullptr) {
-          if (strstr(alloc_type, "ClassLoader") != nullptr ||
-              strcmp(alloc_type, "java.lang.Class") == 0 ||
-              strncmp(alloc_type, "org.dacapo.", 11) == 0) {
-            Atomic::add(&_matching_stats.classloader_leaked, (uint64_t)1);
-            defer = true;
-          }
-        }
-        if (!defer) {
-          // Long-lived singleton protection
-          if (entry.alloc_thread == entry.free_thread) {
-            uint64_t lifetime = (entry.free_seq > entry.alloc_seq) ? (entry.free_seq - entry.alloc_seq) : 1;
-            ThreadEntryIndex& idx = _thread_entry_index[logical_thread];
-            if (idx.entry_count > 0 && lifetime >= (uint64_t)(idx.entry_count * 0.9)) {
-              Atomic::add(&_matching_stats.longlived_leaked, (uint64_t)1);
-              log_info(gc)("Oracle: LONGLIVED_LEAKED type=[%s] size=%zu ptr=" PTR_FORMAT
-                           " lifetime=%" PRIu64 " thread_entries=%zu (%.1f%% of thread %d entries)"
-                           " -- singleton protection, leak safely",
-                           alloc_type, size, p2i(ptr), lifetime, idx.entry_count,
-                           100.0 * lifetime / idx.entry_count, logical_thread);
-              defer = true;
-            }
-          }
-        }
-
-        if (!defer) {
-          MutexLocker ml(_oracle_lock, Mutex::_no_safepoint_check_flag);
-          size_t bucket_idx = hash_thread_seq(logical_thread, target_seq);
-          DeathBucket* db = NEW_C_HEAP_OBJ(DeathBucket, mtGC);
-          db->logical_thread = logical_thread;
-          db->seq = target_seq;
-          db->ptr = ptr;
-          db->size = size;
-          db->next = _death_map[bucket_idx];
-          _death_map[bucket_idx] = db;
-        }
-
-        Atomic::add(&_matching_stats.site_counter_matches, (uint64_t)1);
-        Atomic::add(&_tracked_alloc_counter, (uint64_t)1);
-        Atomic::add(&_allocated_bytes, size);
-
-        log_info(gc)("Oracle: SITE_COUNTER_MATCH logical_thread=%d seq=%" PRIu64
-                     " site=[%s] invocation=%" PRIu64 " size=%zu ptr=" PTR_FORMAT,
-                     logical_thread, per_thread_seq, alloc_site,
-                     site_invocation, size, p2i(ptr));
-        return true;
-      }
-
-      // (Layer 2 SITE_FIFO_MATCH removed — fall through to SITE_MAX_MATCH below)
-    }
-    // Site counter didn't match — fall through to SITE_MAX_MATCH
-  }
-
-  // ============================================================
-  // LAYER 2: SITE_MAX_MATCH — use per-site max lifetime (replaces FIFO)
-  // ============================================================
+  // All allocations at a known site get the site's max lifetime.
+  // This is guaranteed safe: max lifetime >= any individual entry's lifetime.
   if (alloc_site != nullptr && alloc_site[0] != '\0') {
     uint64_t site_max = get_site_max_lifetime(logical_thread, alloc_site);
     if (site_max > 0) {
       uint64_t target_seq = per_thread_seq + site_max;
 
-      // Infrastructure protection: same rules as schedule_death_relative()
+      // Infrastructure protection
       bool defer = false;
       if (EpsilonOracleNoFreeThread0 && logical_thread == 0) {
         Atomic::add(&_matching_stats.thread0_leaked, (uint64_t)1);
