@@ -1647,175 +1647,105 @@ bool EpsilonOracle::register_allocation(int64_t runtime_thread_id, void* ptr, si
         return true;
       }
 
-      // Layer 2: Site FIFO scan (counter missed, try any entry with matching size)
-      prev = nullptr;
-      node = sq->head;
-      matched_node = nullptr;
-      matched_prev = nullptr;
-      scan_count = 0;
-
-      while (node != nullptr && scan_count < (int)EpsilonOracleLookahead) {
-        OracleEntry& candidate = _entries[node->entry_idx];
-        if (candidate.size == size &&
-            (alloc_type == nullptr || candidate.type[0] == '\0' ||
-             strcmp(candidate.type, alloc_type) == 0)) {
-          matched_node = node;
-          matched_prev = prev;
-          break;
-        }
-        prev = node;
-        node = node->next;
-        scan_count++;
-      }
-
-      if (matched_node != nullptr) {
-        // SITE_FIFO_MATCH: site matched, correct size + type, but invocation counter diverged
-        OracleEntry& entry = _entries[matched_node->entry_idx];
-        uint64_t oracle_invocation = matched_node->site_invocation;  // Save before free
-
-        // Remove from FIFO
-        if (matched_prev != nullptr) {
-          matched_prev->next = matched_node->next;
-        } else {
-          sq->head = matched_node->next;
-        }
-        if (sq->tail == matched_node) {
-          sq->tail = matched_prev;
-        }
-        sq->count--;
-        FREE_C_HEAP_OBJ(matched_node);
-
-        update_lifetime_stats(state, entry);
-        schedule_death_relative(entry, ptr, size, logical_thread, per_thread_seq);
-
-        Atomic::add(&_matching_stats.site_fifo_matches, (uint64_t)1);
-        Atomic::add(&_tracked_alloc_counter, (uint64_t)1);
-        Atomic::add(&_allocated_bytes, size);
-
-        log_info(gc)("Oracle: SITE_FIFO_MATCH logical_thread=%d seq=%" PRIu64
-                     " site=[%s] invocation=%" PRIu64 " (oracle_invocation=%" PRIu64
-                     ") size=%zu ptr=" PTR_FORMAT,
-                     logical_thread, per_thread_seq, alloc_site,
-                     site_invocation, oracle_invocation,
-                     size, p2i(ptr));
-        return true;
-      }
-
-      // Site queue exists but no size match — fall through to Layer 3 (type FIFO)
+      // (Layer 2 SITE_FIFO_MATCH removed — fall through to SITE_MAX_MATCH below)
     }
-    // Site queue doesn't exist or is empty — fall through to Layer 3
+    // Site counter didn't match — fall through to SITE_MAX_MATCH
   }
 
   // ============================================================
-  // LAYER 3: Type-keyed FIFO matching (fallback when site unavailable or missed)
+  // LAYER 2: SITE_MAX_MATCH — use per-site max lifetime (replaces FIFO)
+  // ============================================================
+  if (alloc_site != nullptr && alloc_site[0] != '\0') {
+    uint64_t site_max = get_site_max_lifetime(logical_thread, alloc_site);
+    if (site_max > 0) {
+      uint64_t target_seq = per_thread_seq + site_max;
+
+      // Infrastructure protection: same rules as schedule_death_relative()
+      bool defer = false;
+      if (EpsilonOracleNoFreeThread0 && logical_thread == 0) {
+        Atomic::add(&_matching_stats.thread0_leaked, (uint64_t)1);
+        defer = true;
+      }
+      if (!defer && alloc_type != nullptr) {
+        if (strstr(alloc_type, "ClassLoader") != nullptr ||
+            strcmp(alloc_type, "java.lang.Class") == 0 ||
+            strncmp(alloc_type, "org.dacapo.", 11) == 0) {
+          Atomic::add(&_matching_stats.classloader_leaked, (uint64_t)1);
+          defer = true;
+        }
+      }
+
+      if (!defer) {
+        MutexLocker ml(_oracle_lock, Mutex::_no_safepoint_check_flag);
+        size_t bucket_idx = hash_thread_seq(logical_thread, target_seq);
+        DeathBucket* db = NEW_C_HEAP_OBJ(DeathBucket, mtGC);
+        db->logical_thread = logical_thread;
+        db->seq = target_seq;
+        db->ptr = ptr;
+        db->size = size;
+        db->next = _death_map[bucket_idx];
+        _death_map[bucket_idx] = db;
+      }
+
+      Atomic::add(&_matching_stats.site_max_matches, (uint64_t)1);
+      Atomic::add(&_tracked_alloc_counter, (uint64_t)1);
+      Atomic::add(&_allocated_bytes, size);
+
+      log_info(gc)("Oracle: SITE_MAX_MATCH logical_thread=%d seq=%" PRIu64
+                   " site=[%s] max_lifetime=%" PRIu64 " size=%zu ptr=" PTR_FORMAT,
+                   logical_thread, per_thread_seq, alloc_site,
+                   site_max, size, p2i(ptr));
+      return true;
+    }
+  }
+
+  // ============================================================
+  // LAYER 3: TYPE_MAX_MATCH — use per-type max lifetime (fallback)
   // ============================================================
   if (alloc_type != nullptr && alloc_type[0] != '\0') {
-    size_t bucket = hash_type_name(alloc_type);
+    uint64_t type_max = get_type_max_lifetime(logical_thread, alloc_type);
+    if (type_max > 0) {
+      uint64_t target_seq = per_thread_seq + type_max;
 
-    // Find type queue for this type
-    TypeQueue* queue = state->type_queues[bucket];
-    while (queue != nullptr) {
-      if (strcmp(queue->type_name, alloc_type) == 0) break;
-      queue = queue->next;
+      // Infrastructure protection
+      bool defer = false;
+      if (EpsilonOracleNoFreeThread0 && logical_thread == 0) {
+        Atomic::add(&_matching_stats.thread0_leaked, (uint64_t)1);
+        defer = true;
+      }
+      if (!defer) {
+        if (strstr(alloc_type, "ClassLoader") != nullptr ||
+            strcmp(alloc_type, "java.lang.Class") == 0 ||
+            strncmp(alloc_type, "org.dacapo.", 11) == 0) {
+          Atomic::add(&_matching_stats.classloader_leaked, (uint64_t)1);
+          defer = true;
+        }
+      }
+
+      if (!defer) {
+        MutexLocker ml(_oracle_lock, Mutex::_no_safepoint_check_flag);
+        size_t bucket_idx = hash_thread_seq(logical_thread, target_seq);
+        DeathBucket* db = NEW_C_HEAP_OBJ(DeathBucket, mtGC);
+        db->logical_thread = logical_thread;
+        db->seq = target_seq;
+        db->ptr = ptr;
+        db->size = size;
+        db->next = _death_map[bucket_idx];
+        _death_map[bucket_idx] = db;
+      }
+
+      Atomic::add(&_matching_stats.type_max_matches, (uint64_t)1);
+      Atomic::add(&_tracked_alloc_counter, (uint64_t)1);
+      Atomic::add(&_allocated_bytes, size);
+
+      log_info(gc)("Oracle: TYPE_MAX_MATCH logical_thread=%d seq=%" PRIu64
+                   " type=[%s] max_lifetime=%" PRIu64 " size=%zu ptr=" PTR_FORMAT,
+                   logical_thread, per_thread_seq, alloc_type,
+                   type_max, size, p2i(ptr));
+      return true;
     }
 
-    if (queue != nullptr && queue->head != nullptr) {
-      // Scan FIFO for entry matching BOTH type AND size.
-      // FIFO order alone is unreliable when allocation patterns diverge between
-      // trace and replay. Size validation prevents assigning wrong lifetimes
-      // (e.g., a short-lived 144-byte byte[] lifetime to a 140KB byte[] buffer).
-      TypeQueueNode* prev = nullptr;
-      TypeQueueNode* node = queue->head;
-      TypeQueueNode* matched_node = nullptr;
-      int scan_count = 0;
-      int scan_limit = (int)EpsilonOracleLookahead;  // Reuse lookahead limit
-
-      while (node != nullptr && scan_count < scan_limit) {
-        OracleEntry& candidate = _entries[node->entry_idx];
-        if (candidate.size == size) {
-          // Size matches. Now validate allocating method if available.
-          bool method_ok = true;
-          if (EpsilonOracleValidateSite &&
-              alloc_method != nullptr && alloc_method[0] != '\0' &&
-              candidate.alloc_method[0] != '\0') {
-            method_ok = (strcmp(candidate.alloc_method, alloc_method) == 0);
-          }
-
-          if (method_ok) {
-            // Found type+size+method match -- remove from FIFO
-            matched_node = node;
-            if (prev == nullptr) {
-              queue->head = node->next;
-            } else {
-              prev->next = node->next;
-            }
-            if (queue->tail == node) {
-              queue->tail = prev;
-            }
-            queue->count--;
-            break;
-          }
-          // Size matched but method didn't -- skip this entry, keep scanning
-        }
-        prev = node;
-        node = node->next;
-        scan_count++;
-      }
-
-      if (matched_node != nullptr) {
-        // Use RELATIVE lifetime from the matched oracle entry (fixes seq divergence)
-        OracleEntry& entry = _entries[matched_node->entry_idx];
-        update_lifetime_stats(state, entry);
-        schedule_death_relative(entry, ptr, size, logical_thread, per_thread_seq);
-
-        Atomic::add(&_matching_stats.type_matches, (uint64_t)1);
-        Atomic::add(&_tracked_alloc_counter, (uint64_t)1);
-        Atomic::add(&_allocated_bytes, size);
-
-        log_info(gc)("Oracle: TYPE_MATCH logical_thread=%d seq=%" PRIu64 " type=[%s] size=%zu ptr=" PTR_FORMAT
-                     " -> free at logical_thread=%d seq=%" PRIu64 " (scanned %d) method=[%s] oracle_method=[%s]",
-                     logical_thread, per_thread_seq, alloc_type, size, p2i(ptr),
-                     entry.free_thread, entry.free_seq, scan_count,
-                     (alloc_method ? alloc_method : ""),
-                     entry.alloc_method);
-
-        FREE_C_HEAP_OBJ(matched_node);
-        return true;
-      }
-
-      // No match found within lookahead. Could be size mismatch or site mismatch.
-      // Check if any size-matched entry was rejected due to method validation:
-      if (EpsilonOracleValidateSite && alloc_method != nullptr && alloc_method[0] != '\0') {
-        TypeQueueNode* check = queue->head;
-        int check_count = 0;
-        bool had_size_match = false;
-        while (check != nullptr && check_count < scan_limit) {
-          OracleEntry& c = _entries[check->entry_idx];
-          if (c.size == size) { had_size_match = true; break; }
-          check = check->next;
-          check_count++;
-        }
-        if (had_size_match) {
-          Atomic::add(&_matching_stats.site_mismatch, (uint64_t)1);
-          log_debug(gc)("Oracle: SITE_MISMATCH logical_thread=%d seq=%" PRIu64
-                        " type=[%s] size=%zu method=[%s] ptr=" PTR_FORMAT
-                        " (type+size matched but method didn't - leak safely)",
-                        logical_thread, per_thread_seq, alloc_type, size,
-                        alloc_method, p2i(ptr));
-          return false;
-        }
-      }
-      // No size match at all
-      Atomic::add(&_matching_stats.type_size_mismatch, (uint64_t)1);
-
-      log_debug(gc)("Oracle: TYPE_SIZE_MISMATCH logical_thread=%d seq=%" PRIu64 " type=[%s] size=%zu ptr=" PTR_FORMAT
-                    " (no size match in %d entries - leak safely)",
-                    logical_thread, per_thread_seq, alloc_type, size, p2i(ptr), scan_count);
-
-      return false;
-    }
-
-    // Type queue empty or not found - this allocation doesn't match any oracle entry.
+    // Type not in lifetime map — this allocation doesn't match any oracle entry.
     // This is expected for JVM-internal allocations that happen while depth > 0
     // (e.g., java.lang.Class, byte[] for class data during class loading).
     // Leak safely: don't schedule any death. Estimated deaths cause premature frees
@@ -2450,6 +2380,9 @@ void EpsilonOracle::finalize() {
   log_info(gc)("    Thread0 leak:   %" PRIu64, _matching_stats.thread0_leaked);
   log_info(gc)("    Site ctr match: %" PRIu64, _matching_stats.site_counter_matches);
   log_info(gc)("    Site FIFO match:%" PRIu64, _matching_stats.site_fifo_matches);
+  log_info(gc)("    Site max match: %" PRIu64, _matching_stats.site_max_matches);
+  log_info(gc)("    Type max match: %" PRIu64, _matching_stats.type_max_matches);
+  log_info(gc)("    Unmatched leak: %" PRIu64, _matching_stats.unmatched_leaked);
   log_info(gc)("    Min life leaked:%" PRIu64, _matching_stats.min_lifetime_leaked);
   log_info(gc)("    Stat outlier:   %" PRIu64, _matching_stats.stat_outlier_leaked);
   log_info(gc)("    Site mismatch:  %" PRIu64, _matching_stats.site_mismatch);
