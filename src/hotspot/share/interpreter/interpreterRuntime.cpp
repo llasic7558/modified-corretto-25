@@ -231,6 +231,71 @@ static volatile int _oracle_skip_boot = 0;
 static volatile int _oracle_tracked = 0;
 static volatile int _oracle_total_calls = 0;
 
+// Get the method name for site key computation, matching ET's convention.
+// ET (Javassist) uses the class simple name for constructors instead of "<init>".
+// E.g., for org.apache.commons.cli.Option.<init>, ET uses "Option".
+// For inner classes like Search$QueryProcessor.<init>, ET uses "Search$QueryProcessor".
+// The simple name is the part after the last '.' in the external class name.
+static const char* site_key_method_name(Method* m, char* buf, size_t buf_size) {
+  const char* method_name = m->name()->as_C_string();
+  if (strcmp(method_name, "<init>") == 0) {
+    const char* class_name = m->method_holder()->external_name();
+    const char* simple = strrchr(class_name, '.');
+    if (simple != nullptr) {
+      simple++;  // skip the '.'
+    } else {
+      simple = class_name;  // no package prefix
+    }
+    strncpy(buf, simple, buf_size - 1);
+    buf[buf_size - 1] = '\0';
+    return buf;
+  }
+  return method_name;
+}
+
+// Append caller info to site_key: "Class:method:N" → "Class:method:N@CallerClass:callerMethod"
+// Walks one frame up via java_sender() to get the calling method.
+static void append_caller_to_site_key(LastFrameAccessor& last_frame, char* site_key, size_t site_key_size) {
+  frame caller_frame = last_frame.get_frame().java_sender();
+  if (caller_frame.is_interpreted_frame()) {
+    Method* caller = caller_frame.interpreter_frame_method();
+    const char* caller_class = caller->method_holder()->external_name();
+    const char* simple = strrchr(caller_class, '.');
+    simple = simple ? simple + 1 : caller_class;
+
+    char caller_method_buf[128];
+    const char* caller_name = site_key_method_name(caller, caller_method_buf, sizeof(caller_method_buf));
+
+    size_t len = strlen(site_key);
+    snprintf(site_key + len, site_key_size - len, "@%s:%s", simple, caller_name);
+  }
+}
+
+// Count allocation bytecodes (new, newarray, anewarray) before a given BCI.
+// Used to compute the Nth-new index for allocation site keys.
+static int count_alloc_bytecodes_before(Method* m, int target_bci) {
+  int count = 0;
+  address code_base = m->code_base();
+  int code_size = m->code_size();
+  int bci = 0;
+
+  while (bci < target_bci && bci < code_size) {
+    Bytecodes::Code bc = Bytecodes::java_code_at(m, code_base + bci);
+    if (bc == Bytecodes::_new || bc == Bytecodes::_newarray || bc == Bytecodes::_anewarray) {
+      count++;
+    }
+    // Advance BCI by the length of this bytecode
+    int len = Bytecodes::length_for(bc);
+    if (len <= 0) {
+      // Variable-length bytecode (tableswitch, lookupswitch, wide)
+      len = Bytecodes::length_at(m, code_base + bci);
+    }
+    if (len <= 0) break;  // Safety: avoid infinite loop on malformed bytecode
+    bci += len;
+  }
+  return count;
+}
+
 static bool oracle_should_track_allocation(JavaThread* current, ConstantPool* pool, Klass* alloc_klass = nullptr) {
   if (!UseEpsilonGC || !EpsilonOracleMode) return false;
 
@@ -241,13 +306,18 @@ static bool oracle_should_track_allocation(JavaThread* current, ConstantPool* po
   // ET checks class name prefixes: java/, javax/, jdk/, sun/, com/sun/.
   // We use the same check instead of boot-classloader to avoid divergence
   // (boot classloader != name prefix for all cases).
+  // Also skip library prefixes that ET skips (javassist/, org/slf4j/, etc.)
   InstanceKlass* pool_holder = pool->pool_holder();
   const char* klass_name = pool_holder->name()->as_C_string(); // internal format: java/lang/String
   if (strncmp(klass_name, "java/", 5) == 0 ||
       strncmp(klass_name, "javax/", 6) == 0 ||
       strncmp(klass_name, "jdk/", 4) == 0 ||
       strncmp(klass_name, "sun/", 4) == 0 ||
-      strncmp(klass_name, "com/sun/", 8) == 0) {
+      strncmp(klass_name, "com/sun/", 8) == 0 ||
+      strncmp(klass_name, "javassist/", 10) == 0 ||
+      strncmp(klass_name, "org/slf4j/", 10) == 0 ||
+      strncmp(klass_name, "org/apache/logging/", 19) == 0 ||
+      strncmp(klass_name, "com/github/luben/zstd/", 22) == 0) {
     Atomic::inc(&_oracle_skip_boot);
     if (_oracle_skip_boot <= 10 && EpsilonOracleVerboseTracking) {
       LastFrameAccessor last_frame2(current);
@@ -261,11 +331,48 @@ static bool oracle_should_track_allocation(JavaThread* current, ConstantPool* po
     return false;
   }
 
-  // NOTE: Method-level filtering (<init>, <clinit>, etc.) was REMOVED.
+  // Skip classes that ET fails to instrument due to Javassist BadBytecode errors.
+  // These classes have allocations invisible to ET, creating phantom allocations
+  // that shift per-thread sequence counters and corrupt relative lifetime calculations.
+  // List generated from ET3 diagnostic output on DaCapo lusearch (small).
+  static const char* _et_failed_classes[] = {
+    "org/apache/lucene/backward_codecs/lucene70/Lucene70DocValuesProducer",
+    "org/apache/lucene/backward_codecs/lucene80/Lucene80DocValuesProducer",
+    "org/apache/lucene/codecs/lucene90/Lucene90DocValuesProducer",
+    "org/apache/lucene/codecs/lucene90/Lucene90CompoundFormat",
+    "org/apache/lucene/index/IndexWriter",
+    "org/apache/lucene/search/TimeLimitingBulkScorer",
+    "org/apache/lucene/analysis/CharArrayMap",
+    nullptr
+  };
+  for (const char** p = _et_failed_classes; *p != nullptr; p++) {
+    if (strcmp(klass_name, *p) == 0) {
+      Atomic::inc(&_oracle_skip_boot);
+      if (EpsilonOracleVerboseTracking) {
+        log_info(gc)("Oracle SKIP_ET_FAILED: class=%s", pool_holder->external_name());
+      }
+      return false;
+    }
+  }
+
+  // Skip <clinit> (static initializer) methods. Javassist cannot safely instrument
+  // <clinit> due to "Operand stack underflow" errors, so ET never records allocations
+  // inside static initializers. InterpreterRuntime must skip them to match.
+  // NOTE: <init> (constructors) ARE instrumented by ET and must be tracked here.
+  {
+    LastFrameAccessor lfa(current);
+    Method* m = lfa.method();
+    if (strcmp(m->name()->as_C_string(), "<clinit>") == 0) {
+      Atomic::inc(&_oracle_skip_boot);
+      return false;
+    }
+  }
+
+  // NOTE: Method-level filtering for <init>, equals, hashCode, etc. was REMOVED.
   // ET records allocations inside ALL methods of instrumented classes, including
   // <init> constructors. ET's shouldIgnoreMethod() only controls M/E events,
   // NOT allocation tracking. So InterpreterRuntime must track all allocations
-  // in non-bootstrap classes to match the oracle.
+  // in non-bootstrap classes to match the oracle (except <clinit> above).
 
   Atomic::inc(&_oracle_tracked);
 
@@ -309,6 +416,25 @@ JRT_ENTRY(void, InterpreterRuntime::_new(JavaThread* current, ConstantPool* pool
   bool oracle_track = oracle_should_track_allocation(current, pool, klass);
   if (oracle_track) {
     EpsilonThreadLocalData::set_app_code_depth(current, 1);
+    // Set allocating method for oracle site validation
+    LastFrameAccessor last_frame(current);
+    Method* m = last_frame.method();
+    EpsilonThreadLocalData::set_alloc_method(current,
+        m->method_holder()->external_name(),
+        m->name()->as_C_string());
+    // Compute allocation site key: class:method:Nth_new
+    // Uses site_key_method_name() to match ET convention (<init> → class simple name)
+    int bci = last_frame.bci();
+    int nth_new = count_alloc_bytecodes_before(m, bci);
+    char method_buf[128];
+    const char* site_method = site_key_method_name(m, method_buf, sizeof(method_buf));
+    char site_key[256];
+    snprintf(site_key, sizeof(site_key), "%s:%s:%d",
+             m->method_holder()->external_name(),
+             site_method,
+             nth_new);
+    append_caller_to_site_key(last_frame, site_key, sizeof(site_key));
+    EpsilonThreadLocalData::set_alloc_site(current, site_key);
   }
 
   // Use THREAD instead of CHECK to ensure app_code_depth is reset on exception
@@ -316,6 +442,8 @@ JRT_ENTRY(void, InterpreterRuntime::_new(JavaThread* current, ConstantPool* pool
 
   if (oracle_track) {
     EpsilonThreadLocalData::set_app_code_depth(current, 0);
+    EpsilonThreadLocalData::clear_alloc_method(current);
+    EpsilonThreadLocalData::clear_alloc_site(current);
   }
   if (HAS_PENDING_EXCEPTION) return;
 
@@ -331,11 +459,28 @@ JRT_ENTRY(void, InterpreterRuntime::newarray(JavaThread* current, BasicType type
   bool oracle_track = false;
   if (UseEpsilonGC && EpsilonOracleMode) {
     LastFrameAccessor last_frame(current);
-    ConstantPool* pool = last_frame.method()->constants();
+    Method* m = last_frame.method();
+    ConstantPool* pool = m->constants();
     Klass* alloc_klass = Universe::typeArrayKlass(type);
     oracle_track = oracle_should_track_allocation(current, pool, alloc_klass);
     if (oracle_track) {
       EpsilonThreadLocalData::set_app_code_depth(current, 1);
+      EpsilonThreadLocalData::set_alloc_method(current,
+          m->method_holder()->external_name(),
+          m->name()->as_C_string());
+      // Compute allocation site key for array allocation
+      // Uses site_key_method_name() to match ET convention (<init> → class simple name)
+      int bci = last_frame.bci();
+      int nth_new = count_alloc_bytecodes_before(m, bci);
+      char method_buf[128];
+      const char* site_method = site_key_method_name(m, method_buf, sizeof(method_buf));
+      char site_key[256];
+      snprintf(site_key, sizeof(site_key), "%s:%s:%d",
+               m->method_holder()->external_name(),
+               site_method,
+               nth_new);
+      append_caller_to_site_key(last_frame, site_key, sizeof(site_key));
+      EpsilonThreadLocalData::set_alloc_site(current, site_key);
     }
   }
 
@@ -344,6 +489,8 @@ JRT_ENTRY(void, InterpreterRuntime::newarray(JavaThread* current, BasicType type
 
   if (oracle_track) {
     EpsilonThreadLocalData::set_app_code_depth(current, 0);
+    EpsilonThreadLocalData::clear_alloc_method(current);
+    EpsilonThreadLocalData::clear_alloc_site(current);
   }
   if (HAS_PENDING_EXCEPTION) return;
 
@@ -357,6 +504,24 @@ JRT_ENTRY(void, InterpreterRuntime::anewarray(JavaThread* current, ConstantPool*
   bool oracle_track = oracle_should_track_allocation(current, pool, klass);
   if (oracle_track) {
     EpsilonThreadLocalData::set_app_code_depth(current, 1);
+    LastFrameAccessor last_frame(current);
+    Method* m = last_frame.method();
+    EpsilonThreadLocalData::set_alloc_method(current,
+        m->method_holder()->external_name(),
+        m->name()->as_C_string());
+    // Compute allocation site key for object array allocation
+    // Uses site_key_method_name() to match ET convention (<init> → class simple name)
+    int bci = last_frame.bci();
+    int nth_new = count_alloc_bytecodes_before(m, bci);
+    char method_buf[128];
+    const char* site_method = site_key_method_name(m, method_buf, sizeof(method_buf));
+    char site_key[256];
+    snprintf(site_key, sizeof(site_key), "%s:%s:%d",
+             m->method_holder()->external_name(),
+             site_method,
+             nth_new);
+    append_caller_to_site_key(last_frame, site_key, sizeof(site_key));
+    EpsilonThreadLocalData::set_alloc_site(current, site_key);
   }
 
   // Use THREAD instead of CHECK to ensure app_code_depth is reset on exception
@@ -364,6 +529,8 @@ JRT_ENTRY(void, InterpreterRuntime::anewarray(JavaThread* current, ConstantPool*
 
   if (oracle_track) {
     EpsilonThreadLocalData::set_app_code_depth(current, 0);
+    EpsilonThreadLocalData::clear_alloc_method(current);
+    EpsilonThreadLocalData::clear_alloc_site(current);
   }
   if (HAS_PENDING_EXCEPTION) return;
 
@@ -384,6 +551,23 @@ JRT_ENTRY(void, InterpreterRuntime::multianewarray(JavaThread* current, jint* fi
   bool oracle_track = oracle_should_track_allocation(current, constants, klass);
   if (oracle_track) {
     EpsilonThreadLocalData::set_app_code_depth(current, 1);
+    Method* m = last_frame.method();
+    EpsilonThreadLocalData::set_alloc_method(current,
+        m->method_holder()->external_name(),
+        m->name()->as_C_string());
+    // Compute allocation site key for multi-dimensional array
+    // Uses site_key_method_name() to match ET convention (<init> → class simple name)
+    int bci = last_frame.bci();
+    int nth_new = count_alloc_bytecodes_before(m, bci);
+    char method_buf[128];
+    const char* site_method = site_key_method_name(m, method_buf, sizeof(method_buf));
+    char site_key[256];
+    snprintf(site_key, sizeof(site_key), "%s:%s:%d",
+             m->method_holder()->external_name(),
+             site_method,
+             nth_new);
+    append_caller_to_site_key(last_frame, site_key, sizeof(site_key));
+    EpsilonThreadLocalData::set_alloc_site(current, site_key);
   }
 
   // We must create an array of jints to pass to multi_allocate.
@@ -404,6 +588,8 @@ JRT_ENTRY(void, InterpreterRuntime::multianewarray(JavaThread* current, jint* fi
 
   if (oracle_track) {
     EpsilonThreadLocalData::set_app_code_depth(current, 0);
+    EpsilonThreadLocalData::clear_alloc_method(current);
+    EpsilonThreadLocalData::clear_alloc_site(current);
   }
   if (HAS_PENDING_EXCEPTION) return;
 

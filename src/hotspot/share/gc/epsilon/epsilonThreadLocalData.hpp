@@ -37,12 +37,17 @@ private:
   int64_t _last_tlab_time;
   Klass* _current_alloc_klass;  // For oracle mode: Klass being allocated
   int _app_code_depth;             // For oracle mode: depth counter set by InterpreterRuntime
+  char _alloc_method[128];         // For oracle mode: "class#method" of the allocating method
+  char _alloc_site[256];           // For oracle mode: "class:method:N@CallerClass:callerMethod" deepened site key
 
   EpsilonThreadLocalData() :
           _ergo_tlab_size(0),
           _last_tlab_time(0),
           _current_alloc_klass(nullptr),
-          _app_code_depth(0) {}
+          _app_code_depth(0) {
+    _alloc_method[0] = '\0';
+    _alloc_site[0] = '\0';
+  }
 
   static EpsilonThreadLocalData* data(Thread* thread) {
     assert(UseEpsilonGC, "Sanity");
@@ -97,6 +102,43 @@ public:
   // Check if currently in application code (depth > 0)
   static bool in_app_code(Thread* thread) {
     return data(thread)->_app_code_depth > 0;
+  }
+
+  // Oracle mode: allocating method name (class.name#method format, matching ET methods.list)
+  static const char* alloc_method(Thread* thread) {
+    return data(thread)->_alloc_method;
+  }
+
+  static void set_alloc_method(Thread* thread, const char* class_name, const char* method_name) {
+    char* buf = data(thread)->_alloc_method;
+    if (class_name != nullptr && method_name != nullptr) {
+      // class_name from external_name() uses dots (e.g., "org.apache.lucene.index.SegmentReader")
+      snprintf(buf, sizeof(data(thread)->_alloc_method), "%s#%s", class_name, method_name);
+    } else {
+      buf[0] = '\0';
+    }
+  }
+
+  static void clear_alloc_method(Thread* thread) {
+    data(thread)->_alloc_method[0] = '\0';
+  }
+
+  // Oracle mode: allocation site key ("class:method:N" format for site-keyed matching)
+  static const char* alloc_site(Thread* thread) {
+    return data(thread)->_alloc_site;
+  }
+
+  static void set_alloc_site(Thread* thread, const char* site_key) {
+    if (site_key != nullptr) {
+      strncpy(data(thread)->_alloc_site, site_key, sizeof(data(thread)->_alloc_site) - 1);
+      data(thread)->_alloc_site[sizeof(data(thread)->_alloc_site) - 1] = '\0';
+    } else {
+      data(thread)->_alloc_site[0] = '\0';
+    }
+  }
+
+  static void clear_alloc_site(Thread* thread) {
+    data(thread)->_alloc_site[0] = '\0';
   }
 };
 
