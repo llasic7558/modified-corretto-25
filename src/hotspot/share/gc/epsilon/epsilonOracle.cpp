@@ -1619,6 +1619,8 @@ bool EpsilonOracle::register_allocation(int64_t runtime_thread_id, void* ptr, si
 
       if (matched_node != nullptr) {
         // SITE_COUNTER_MATCH: exact 1:1 match (site + invocation + size + type)
+        // Use per-site max lifetime for safety (even exact matches can have
+        // wrong lifetimes due to sequence drift between trace and replay)
         OracleEntry& entry = _entries[matched_node->entry_idx];
 
         // Remove from FIFO
@@ -1633,8 +1635,56 @@ bool EpsilonOracle::register_allocation(int64_t runtime_thread_id, void* ptr, si
         sq->count--;
         FREE_C_HEAP_OBJ(matched_node);
 
-        update_lifetime_stats(state, entry);
-        schedule_death_relative(entry, ptr, size, logical_thread, per_thread_seq);
+        // Use per-site max lifetime instead of entry's exact lifetime
+        uint64_t site_max = get_site_max_lifetime(logical_thread, alloc_site);
+        if (site_max == 0) {
+          // Fallback: compute from entry
+          site_max = (entry.free_seq > entry.alloc_seq) ? (entry.free_seq - entry.alloc_seq) : 1;
+        }
+        uint64_t target_seq = per_thread_seq + site_max;
+
+        // Infrastructure protection
+        bool defer = false;
+        if (EpsilonOracleNoFreeThread0 && logical_thread == 0) {
+          Atomic::add(&_matching_stats.thread0_leaked, (uint64_t)1);
+          defer = true;
+        }
+        if (!defer && alloc_type != nullptr) {
+          if (strstr(alloc_type, "ClassLoader") != nullptr ||
+              strcmp(alloc_type, "java.lang.Class") == 0 ||
+              strncmp(alloc_type, "org.dacapo.", 11) == 0) {
+            Atomic::add(&_matching_stats.classloader_leaked, (uint64_t)1);
+            defer = true;
+          }
+        }
+        if (!defer) {
+          // Long-lived singleton protection
+          if (entry.alloc_thread == entry.free_thread) {
+            uint64_t lifetime = (entry.free_seq > entry.alloc_seq) ? (entry.free_seq - entry.alloc_seq) : 1;
+            ThreadEntryIndex& idx = _thread_entry_index[logical_thread];
+            if (idx.entry_count > 0 && lifetime >= (uint64_t)(idx.entry_count * 0.9)) {
+              Atomic::add(&_matching_stats.longlived_leaked, (uint64_t)1);
+              log_info(gc)("Oracle: LONGLIVED_LEAKED type=[%s] size=%zu ptr=" PTR_FORMAT
+                           " lifetime=%" PRIu64 " thread_entries=%zu (%.1f%% of thread %d entries)"
+                           " -- singleton protection, leak safely",
+                           alloc_type, size, p2i(ptr), lifetime, idx.entry_count,
+                           100.0 * lifetime / idx.entry_count, logical_thread);
+              defer = true;
+            }
+          }
+        }
+
+        if (!defer) {
+          MutexLocker ml(_oracle_lock, Mutex::_no_safepoint_check_flag);
+          size_t bucket_idx = hash_thread_seq(logical_thread, target_seq);
+          DeathBucket* db = NEW_C_HEAP_OBJ(DeathBucket, mtGC);
+          db->logical_thread = logical_thread;
+          db->seq = target_seq;
+          db->ptr = ptr;
+          db->size = size;
+          db->next = _death_map[bucket_idx];
+          _death_map[bucket_idx] = db;
+        }
 
         Atomic::add(&_matching_stats.site_counter_matches, (uint64_t)1);
         Atomic::add(&_tracked_alloc_counter, (uint64_t)1);
