@@ -320,6 +320,20 @@ HeapWord* EpsilonHeap::allocate_work_oracle(size_t size, bool verbose) {
     alloc_type = normalized_type;
   }
 
+  // Extract allocating method from thread-local data (set by InterpreterRuntime)
+  const char* alloc_method = nullptr;
+  const char* tld_method = EpsilonThreadLocalData::alloc_method(current_thread);
+  if (tld_method[0] != '\0') {
+    alloc_method = tld_method;
+  }
+
+  // Extract allocation site key from thread-local data (set by InterpreterRuntime BCI scan)
+  const char* alloc_site = nullptr;
+  const char* tld_site = EpsilonThreadLocalData::alloc_site(current_thread);
+  if (tld_site[0] != '\0') {
+    alloc_site = tld_site;
+  }
+
   // Get next per-thread allocation sequence number (1-based).
   // This also maps the runtime thread to a logical thread ID on first call,
   // using alloc_type and size_in_bytes for signature-based matching.
@@ -357,16 +371,22 @@ HeapWord* EpsilonHeap::allocate_work_oracle(size_t size, bool verbose) {
     _oracle->track_malloc_ptr(malloc_mem, size_in_bytes);
 
     // Register for future deallocation (returns true if matched oracle entry)
-    bool matched = _oracle->register_allocation(thread_id, malloc_mem, size_in_bytes, alloc_type);
+    bool matched = _oracle->register_allocation(thread_id, malloc_mem, size_in_bytes, alloc_type, alloc_method, alloc_site);
 
     // Track allocated bytes
     Atomic::add(&_oracle_allocated_bytes, size_in_bytes);
 
     if (verbose) {
+      Thread* cur = Thread::current();
+      const char* tname = (cur != nullptr && cur->is_Java_thread()) ?
+                          JavaThread::cast(cur)->name() : "<non-java>";
       log_info(gc)("Oracle MALLOC alloc: thread=" INT64_FORMAT " seq=" UINT64_FORMAT " ptr=" PTR_FORMAT
-                   " size=%zu bytes type=[%s] matched=%s",
+                   " size=%zu bytes type=[%s] method=[%s] matched=%s tname=[%s]",
                    thread_id, per_thread_seq, p2i(malloc_mem), size_in_bytes,
-                   (alloc_type ? alloc_type : "?"), matched ? "true" : "false");
+                   (alloc_type ? alloc_type : "?"),
+                   (alloc_method ? alloc_method : ""),
+                   matched ? "true" : "false",
+                   (tname ? tname : "?"));
     }
 
     return (HeapWord*)malloc_mem;
@@ -397,16 +417,20 @@ HeapWord* EpsilonHeap::allocate_work_oracle(size_t size, bool verbose) {
   memset(mem, 0, size_in_bytes);
 
   // Register this allocation with the oracle for future deallocation
-  bool matched = _oracle->register_allocation(thread_id, mem, size_in_bytes, alloc_type);
+  bool matched = _oracle->register_allocation(thread_id, mem, size_in_bytes, alloc_type, alloc_method, alloc_site);
 
   // Track allocated bytes
   Atomic::add(&_oracle_allocated_bytes, size_in_bytes);
 
   if (verbose) {
+    Thread* cur2 = Thread::current();
+    const char* tname2 = (cur2 != nullptr && cur2->is_Java_thread()) ?
+                         JavaThread::cast(cur2)->name() : "<non-java>";
     log_info(gc)("Oracle alloc: thread=" INT64_FORMAT " seq=" UINT64_FORMAT " ptr=" PTR_FORMAT
-                 " size=%zu bytes type=[%s] matched=%s",
+                 " size=%zu bytes type=[%s] matched=%s tname=[%s]",
                  thread_id, per_thread_seq, p2i(mem), size_in_bytes,
-                 (alloc_type ? alloc_type : "?"), matched ? "true" : "false");
+                 (alloc_type ? alloc_type : "?"), matched ? "true" : "false",
+                 (tname2 ? tname2 : "?"));
   }
 
   return mem;

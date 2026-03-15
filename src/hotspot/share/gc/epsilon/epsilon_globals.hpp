@@ -134,6 +134,13 @@
           "runtime threads map starting from logical thread 1. When "      \
           "false, the first runtime thread maps to logical thread 0.")     \
                                                                             \
+  product(bool, EpsilonOracleNoFreeThread0, true, EXPERIMENTAL,            \
+          "Never schedule deaths for objects allocated on logical thread "  \
+          "0. Thread 0 is typically the harness/setup thread whose "       \
+          "objects include class loaders, vtables, and other JVM "         \
+          "infrastructure that is unsafe to free. Objects are still "      \
+          "matched for statistics but leaked safely.")                      \
+                                                                            \
   product(uint64_t, EpsilonOracleFreeDelay, 0, EXPERIMENTAL,               \
           "Number of global allocations to delay before actually freeing " \
           "memory in malloc mode. Prevents use-after-free from slight "    \
@@ -151,7 +158,26 @@
           "multi-allocation signature matching. Higher values improve "     \
           "thread mapping accuracy but delay mapping and leak more "        \
           "allocations during the buffering phase.")                        \
-          range(1, 64)
+          range(1, 64)                                                      \
+                                                                            \
+  product(bool, EpsilonOracleValidateSite, true, EXPERIMENTAL,              \
+          "Validate allocating method against oracle entry during FIFO "    \
+          "matching. When enabled, TYPE_MATCH entries whose alloc_method "  \
+          "doesn't match the runtime's allocating method are skipped, "     \
+          "preventing FIFO mis-ordering from causing use-after-free.")      \
+                                                                            \
+  product(size_t, EpsilonOracleMinLifetime, 0, EXPERIMENTAL,               \
+          "Minimum relative lifetime (free_seq - alloc_seq) for an oracle " \
+          "match to trigger a free. Entries with shorter lifetimes are "    \
+          "leaked safely. Catches wrong FIFO matches that assign temp "    \
+          "lifetimes to long-lived objects. 0 = disabled.")                 \
+          range(0, max_intx)                                                \
+                                                                            \
+  product(size_t, EpsilonOracleFreeQuarantine, 0, EXPERIMENTAL,            \
+          "Minimum number of additional allocations after scheduled death " \
+          "before actually freeing. Extends the temporal safety buffer "    \
+          "beyond delayed_free(). 0 = disabled.")                          \
+          range(0, max_intx)                                                \
 
 // end of GC_EPSILON_FLAGS
 
