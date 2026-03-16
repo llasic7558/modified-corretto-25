@@ -134,16 +134,13 @@ struct SiteCounter {
   SiteCounter* next;           // Hash chain
 };
 
-// Per-site lifetime aggregate: precomputed during load_trace()
-// Uses P99 lifetime instead of max to avoid extreme outliers inflating death times.
+// Per-(site,size) lifetime aggregate: precomputed during load_trace()
+// Keyed by "site_key:SIZE" to split high-variance sites by allocation size.
 struct SiteLifetimeInfo {
-  uint64_t max_lifetime;       // P99 lifetime (99th percentile) across entries at this site
-  uint64_t count;              // Number of entries at this site
+  uint64_t max_lifetime;       // Maximum lifetime for this (site, size) pair
+  uint64_t count;              // Number of entries
   SiteLifetimeInfo* next;      // Hash chain
-  char site_key[256];          // Site key (deepened) or type name
-  // Temporary fields used during build_site_lifetime_maps(), freed after
-  uint64_t* tmp_lifetimes;     // Array of all lifetimes (for sorting/P99)
-  size_t tmp_fill;             // Current fill position
+  char site_key[256];          // Composite key: "site_key:SIZE" or "type:SIZE"
 };
 
 // Statistics for resilient oracle matching
@@ -285,9 +282,9 @@ private:
   // Build lifetime maps from loaded entries
   void build_site_lifetime_maps();
 
-  // Lookup max lifetime for a site key or type name
-  uint64_t get_site_max_lifetime(int32_t logical_thread, const char* site_key) const;
-  uint64_t get_type_max_lifetime(int32_t logical_thread, const char* type_name) const;
+  // Lookup max lifetime for a (site_key, size) or (type, size) pair
+  uint64_t get_site_max_lifetime(int32_t logical_thread, const char* site_key, size_t size) const;
+  uint64_t get_type_max_lifetime(int32_t logical_thread, const char* type_name, size_t size) const;
 
   // Per-thread allocation state: array indexed by LOGICAL thread ID
   // Direct array access since logical IDs are small (0, 1, 2, ...)
