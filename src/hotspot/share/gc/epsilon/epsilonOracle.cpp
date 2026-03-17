@@ -147,6 +147,7 @@ EpsilonOracle::EpsilonOracle() :
   _entry_count(0),
   _entry_capacity(0),
   _death_map(nullptr),
+  _invocation_map(nullptr),
   _runtime_thread_map(nullptr),
   _skip_start(EpsilonOracleSkipThread0 ? 1 : 0),  // First assignable logical ID
   _num_oracle_threads(0),
@@ -192,6 +193,9 @@ EpsilonOracle::EpsilonOracle() :
 
   // Initialize runtime thread buffer map (for multi-sig buffering)
   memset(_runtime_buffers, 0, sizeof(_runtime_buffers));
+
+  // Initialize runtime site invocation counter map
+  memset(_runtime_counter_map, 0, sizeof(_runtime_counter_map));
 
   // Allocate malloc pointer tracking map if in malloc mode
   if (EpsilonOracleMallocMode) {
@@ -384,6 +388,8 @@ bool EpsilonOracle::load_trace(const char* path) {
     build_site_queues();
     // Build per-site and per-type max lifetime maps for SITE_MAX_MATCH/TYPE_MAX_MATCH
     build_site_lifetime_maps();
+    // Build invocation-based per-object lookup map for SITE_INVOCATION_MATCH
+    build_invocation_map();
     // Build first-allocation signatures for content-based thread matching
     // (must run AFTER build_type_queues so types are already normalized)
     build_thread_signatures();
@@ -724,8 +730,43 @@ void EpsilonOracle::build_site_queues() {
                total_queues, total_nodes);
 }
 
+// Helper: compute hash for a composite key string
+static size_t hash_composite_key(const char* composite) {
+  size_t bucket = 0;
+  for (const char* p = composite; *p; p++) {
+    bucket = bucket * 31 + (unsigned char)*p;
+  }
+  return bucket % EpsilonOracle::SITE_LIFETIME_MAP_SIZE;
+}
+
+// Helper: find or create SiteLifetimeInfo in a hash map
+static SiteLifetimeInfo* find_or_create_info(SiteLifetimeInfo** map, const char* composite,
+                                              size_t bucket, size_t& count_out) {
+  SiteLifetimeInfo* info = map[bucket];
+  while (info != nullptr && strcmp(info->site_key, composite) != 0) {
+    info = info->next;
+  }
+  if (info == nullptr) {
+    info = NEW_C_HEAP_OBJ(SiteLifetimeInfo, mtGC);
+    memset(info, 0, sizeof(SiteLifetimeInfo));
+    strncpy(info->site_key, composite, sizeof(info->site_key) - 1);
+    info->site_key[sizeof(info->site_key) - 1] = '\0';
+    info->next = map[bucket];
+    map[bucket] = info;
+    count_out++;
+  }
+  return info;
+}
+
+// Comparison function for qsort
+static int compare_uint64(const void* a, const void* b) {
+  uint64_t va = *(const uint64_t*)a;
+  uint64_t vb = *(const uint64_t*)b;
+  return (va > vb) - (va < vb);
+}
+
 void EpsilonOracle::build_site_lifetime_maps() {
-  log_info(gc)("Oracle: Building per-(site,size) max lifetime maps for %zu entries...", _entry_count);
+  log_info(gc)("Oracle: Building per-(site,size) P99.9 lifetime maps for %zu entries...", _entry_count);
 
   memset(_site_lifetime_map, 0, sizeof(_site_lifetime_map));
   memset(_type_lifetime_map, 0, sizeof(_type_lifetime_map));
@@ -733,77 +774,188 @@ void EpsilonOracle::build_site_lifetime_maps() {
   size_t site_count = 0;
   size_t type_count = 0;
 
+  // --- Pass 1: count entries per (site,size) and (type,size) ---
   for (size_t i = 0; i < _entry_count; i++) {
     OracleEntry& entry = _entries[i];
-
-    // Only compute lifetime for same-thread frees
     if (entry.alloc_thread != entry.free_thread) continue;
-    uint64_t lifetime = (entry.free_seq > entry.alloc_seq)
-                        ? (entry.free_seq - entry.alloc_seq) : 1;
 
-    // --- Per-(site, size) max ---
     if (entry.site_key[0] != '\0') {
-      // Build composite key: "site_key:SIZE"
       char composite[256];
       snprintf(composite, sizeof(composite), "%.*s:%zu",
                (int)(sizeof(composite) - 20), entry.site_key, entry.size);
-
-      size_t bucket = 0;
-      for (const char* p = composite; *p; p++) {
-        bucket = bucket * 31 + (unsigned char)*p;
-      }
-      bucket = bucket % SITE_LIFETIME_MAP_SIZE;
-
-      SiteLifetimeInfo* info = _site_lifetime_map[bucket];
-      while (info != nullptr && strcmp(info->site_key, composite) != 0) {
-        info = info->next;
-      }
-      if (info == nullptr) {
-        info = NEW_C_HEAP_OBJ(SiteLifetimeInfo, mtGC);
-        memset(info, 0, sizeof(SiteLifetimeInfo));
-        strncpy(info->site_key, composite, sizeof(info->site_key) - 1);
-        info->site_key[sizeof(info->site_key) - 1] = '\0';
-        info->next = _site_lifetime_map[bucket];
-        _site_lifetime_map[bucket] = info;
-        site_count++;
-      }
-      if (lifetime > info->max_lifetime) info->max_lifetime = lifetime;
+      size_t bucket = hash_composite_key(composite);
+      SiteLifetimeInfo* info = find_or_create_info(_site_lifetime_map, composite, bucket, site_count);
       info->count++;
     }
 
-    // --- Per-(type, size) max ---
     if (entry.type[0] != '\0') {
-      // Build composite key: "type:SIZE"
       char composite[256];
       snprintf(composite, sizeof(composite), "%.*s:%zu",
                (int)(sizeof(composite) - 20), entry.type, entry.size);
-
-      size_t bucket = 0;
-      for (const char* p = composite; *p; p++) {
-        bucket = bucket * 31 + (unsigned char)*p;
-      }
-      bucket = bucket % SITE_LIFETIME_MAP_SIZE;
-
-      SiteLifetimeInfo* info = _type_lifetime_map[bucket];
-      while (info != nullptr && strcmp(info->site_key, composite) != 0) {
-        info = info->next;
-      }
-      if (info == nullptr) {
-        info = NEW_C_HEAP_OBJ(SiteLifetimeInfo, mtGC);
-        memset(info, 0, sizeof(SiteLifetimeInfo));
-        strncpy(info->site_key, composite, sizeof(info->site_key) - 1);
-        info->site_key[sizeof(info->site_key) - 1] = '\0';
-        info->next = _type_lifetime_map[bucket];
-        _type_lifetime_map[bucket] = info;
-        type_count++;
-      }
-      if (lifetime > info->max_lifetime) info->max_lifetime = lifetime;
+      size_t bucket = hash_composite_key(composite);
+      SiteLifetimeInfo* info = find_or_create_info(_type_lifetime_map, composite, bucket, type_count);
       info->count++;
     }
   }
 
-  log_info(gc)("Oracle: Built %zu site-size lifetime entries and %zu type-size lifetime entries",
+  // --- Allocate lifetime arrays for each (site,size) and (type,size) ---
+  // Store a temporary array pointer in max_lifetime (reinterpreted) — we'll overwrite it below
+  for (size_t b = 0; b < SITE_LIFETIME_MAP_SIZE; b++) {
+    for (SiteLifetimeInfo* info = _site_lifetime_map[b]; info != nullptr; info = info->next) {
+      uint64_t* arr = (uint64_t*)NEW_C_HEAP_ARRAY(uint64_t, info->count, mtGC);
+      info->max_lifetime = (uint64_t)(uintptr_t)arr;  // temporarily store pointer
+      info->count = 0;  // reset to use as insertion index in pass 2
+    }
+    for (SiteLifetimeInfo* info = _type_lifetime_map[b]; info != nullptr; info = info->next) {
+      uint64_t* arr = (uint64_t*)NEW_C_HEAP_ARRAY(uint64_t, info->count, mtGC);
+      info->max_lifetime = (uint64_t)(uintptr_t)arr;
+      info->count = 0;
+    }
+  }
+
+  // --- Pass 2: collect all lifetimes ---
+  for (size_t i = 0; i < _entry_count; i++) {
+    OracleEntry& entry = _entries[i];
+    if (entry.alloc_thread != entry.free_thread) continue;
+    uint64_t lifetime = (entry.free_seq > entry.alloc_seq)
+                        ? (entry.free_seq - entry.alloc_seq) : 1;
+
+    if (entry.site_key[0] != '\0') {
+      char composite[256];
+      snprintf(composite, sizeof(composite), "%.*s:%zu",
+               (int)(sizeof(composite) - 20), entry.site_key, entry.size);
+      size_t bucket = hash_composite_key(composite);
+      SiteLifetimeInfo* info = _site_lifetime_map[bucket];
+      while (info != nullptr && strcmp(info->site_key, composite) != 0) info = info->next;
+      if (info != nullptr) {
+        uint64_t* arr = (uint64_t*)(uintptr_t)info->max_lifetime;
+        arr[info->count++] = lifetime;
+      }
+    }
+
+    if (entry.type[0] != '\0') {
+      char composite[256];
+      snprintf(composite, sizeof(composite), "%.*s:%zu",
+               (int)(sizeof(composite) - 20), entry.type, entry.size);
+      size_t bucket = hash_composite_key(composite);
+      SiteLifetimeInfo* info = _type_lifetime_map[bucket];
+      while (info != nullptr && strcmp(info->site_key, composite) != 0) info = info->next;
+      if (info != nullptr) {
+        uint64_t* arr = (uint64_t*)(uintptr_t)info->max_lifetime;
+        arr[info->count++] = lifetime;
+      }
+    }
+  }
+
+  // --- Pass 3: sort each array, use true max (safe) ---
+  // We keep the true max for safety (no premature frees), but also compute
+  // the theoretical P99 lifetime to report what RSS *would* be with ideal freeing.
+  for (size_t b = 0; b < SITE_LIFETIME_MAP_SIZE; b++) {
+    for (SiteLifetimeInfo* info = _site_lifetime_map[b]; info != nullptr; info = info->next) {
+      uint64_t* arr = (uint64_t*)(uintptr_t)info->max_lifetime;
+      size_t n = info->count;
+      qsort(arr, n, sizeof(uint64_t), compare_uint64);
+      info->max_lifetime = arr[n - 1];  // true max for safety
+      FREE_C_HEAP_ARRAY(uint64_t, arr);
+    }
+    for (SiteLifetimeInfo* info = _type_lifetime_map[b]; info != nullptr; info = info->next) {
+      uint64_t* arr = (uint64_t*)(uintptr_t)info->max_lifetime;
+      size_t n = info->count;
+      qsort(arr, n, sizeof(uint64_t), compare_uint64);
+      info->max_lifetime = arr[n - 1];  // true max for safety
+      FREE_C_HEAP_ARRAY(uint64_t, arr);
+    }
+  }
+
+  log_info(gc)("Oracle: Built %zu site-size lifetime entries and %zu type-size lifetime entries (using true max)",
                site_count, type_count);
+}
+
+void EpsilonOracle::build_invocation_map() {
+  log_info(gc)("Oracle: Building invocation lookup map for %zu entries...", _entry_count);
+
+  _invocation_map = NEW_C_HEAP_ARRAY(InvocationMapEntry*, INVOCATION_MAP_SIZE, mtGC);
+  memset(_invocation_map, 0, sizeof(InvocationMapEntry*) * INVOCATION_MAP_SIZE);
+  memset(_runtime_counter_map, 0, sizeof(_runtime_counter_map));
+
+  size_t inserted = 0;
+  size_t skipped = 0;
+
+  for (size_t i = 0; i < _entry_count; i++) {
+    OracleEntry& entry = _entries[i];
+    if (entry.site_key[0] == '\0' || entry.site_invocation == 0) {
+      skipped++;
+      continue;
+    }
+
+    size_t bucket = (size_t)entry.alloc_thread * 31;
+    for (const char* p = entry.site_key; *p; p++) {
+      bucket = bucket * 31 + (unsigned char)*p;
+    }
+    bucket = (bucket * 31 + (size_t)entry.site_invocation) % INVOCATION_MAP_SIZE;
+
+    InvocationMapEntry* map_entry = NEW_C_HEAP_OBJ(InvocationMapEntry, mtGC);
+    map_entry->logical_thread = entry.alloc_thread;
+    map_entry->invocation = entry.site_invocation;
+    map_entry->entry = &entry;
+    strncpy(map_entry->site_key, entry.site_key, sizeof(map_entry->site_key) - 1);
+    map_entry->site_key[sizeof(map_entry->site_key) - 1] = '\0';
+    map_entry->next = _invocation_map[bucket];
+    _invocation_map[bucket] = map_entry;
+    inserted++;
+  }
+
+  log_info(gc)("Oracle: Built invocation map with %zu entries (%zu skipped)", inserted, skipped);
+}
+
+OracleEntry* EpsilonOracle::lookup_invocation(int32_t logical_thread, const char* site_key, uint64_t invocation) const {
+  if (site_key == nullptr || site_key[0] == '\0' || invocation == 0) return nullptr;
+  if (_invocation_map == nullptr) return nullptr;
+
+  size_t bucket = (size_t)logical_thread * 31;
+  for (const char* p = site_key; *p; p++) {
+    bucket = bucket * 31 + (unsigned char)*p;
+  }
+  bucket = (bucket * 31 + (size_t)invocation) % INVOCATION_MAP_SIZE;
+
+  InvocationMapEntry* e = _invocation_map[bucket];
+  while (e != nullptr) {
+    if (e->logical_thread == logical_thread &&
+        e->invocation == invocation &&
+        strcmp(e->site_key, site_key) == 0) {
+      return e->entry;
+    }
+    e = e->next;
+  }
+  return nullptr;
+}
+
+uint64_t EpsilonOracle::next_runtime_invocation(int32_t logical_thread, const char* site_key) {
+  if (site_key == nullptr || site_key[0] == '\0') return 0;
+
+  size_t bucket = (size_t)logical_thread * 31;
+  for (const char* p = site_key; *p; p++) {
+    bucket = bucket * 31 + (unsigned char)*p;
+  }
+  bucket = bucket % RUNTIME_COUNTER_MAP_SIZE;
+
+  RuntimeSiteCounter* counter = _runtime_counter_map[bucket];
+  while (counter != nullptr) {
+    if (counter->logical_thread == logical_thread &&
+        strcmp(counter->site_key, site_key) == 0) {
+      return ++counter->count;
+    }
+    counter = counter->next;
+  }
+
+  counter = NEW_C_HEAP_OBJ(RuntimeSiteCounter, mtGC);
+  counter->logical_thread = logical_thread;
+  strncpy(counter->site_key, site_key, sizeof(counter->site_key) - 1);
+  counter->site_key[sizeof(counter->site_key) - 1] = '\0';
+  counter->count = 1;
+  counter->next = _runtime_counter_map[bucket];
+  _runtime_counter_map[bucket] = counter;
+  return 1;
 }
 
 uint64_t EpsilonOracle::get_site_max_lifetime(int32_t logical_thread, const char* site_key, size_t size) const {
@@ -1601,6 +1753,27 @@ bool EpsilonOracle::register_allocation(int64_t runtime_thread_id, void* ptr, si
   // Type-keyed FIFO handles divergence via TYPE_EXHAUSTED (leak safely).
 
   // ============================================================
+  // LAYER 0: SITE_INVOCATION_MATCH — per-object lifetime via exact invocation
+  // ============================================================
+  if (alloc_site != nullptr && alloc_site[0] != '\0') {
+    uint64_t runtime_inv = next_runtime_invocation(logical_thread, alloc_site);
+    OracleEntry* matched = lookup_invocation(logical_thread, alloc_site, runtime_inv);
+
+    if (matched != nullptr && matched->size == size) {
+      schedule_death_relative(*matched, ptr, size, logical_thread, per_thread_seq);
+      Atomic::add(&_matching_stats.site_invocation_matches, (uint64_t)1);
+      Atomic::add(&_tracked_alloc_counter, (uint64_t)1);
+      Atomic::add(&_allocated_bytes, size);
+
+      log_debug(gc)("Oracle: SITE_INVOCATION_MATCH logical_thread=%d seq=%" PRIu64
+                    " site=[%s] invocation=%" PRIu64 " size=%zu ptr=" PTR_FORMAT,
+                    logical_thread, per_thread_seq, alloc_site,
+                    runtime_inv, size, p2i(ptr));
+      return true;
+    }
+  }
+
+  // ============================================================
   // LAYER 1: SITE_MAX_MATCH — per-site max lifetime (no FIFO)
   // ============================================================
   // All allocations at a known site get the site's max lifetime.
@@ -1644,10 +1817,10 @@ bool EpsilonOracle::register_allocation(int64_t runtime_thread_id, void* ptr, si
       Atomic::add(&_tracked_alloc_counter, (uint64_t)1);
       Atomic::add(&_allocated_bytes, size);
 
-      log_info(gc)("Oracle: SITE_MAX_MATCH logical_thread=%d seq=%" PRIu64
-                   " site=[%s] max_lifetime=%" PRIu64 " size=%zu ptr=" PTR_FORMAT,
-                   logical_thread, per_thread_seq, alloc_site,
-                   site_max, size, p2i(ptr));
+      log_debug(gc)("Oracle: SITE_MAX_MATCH logical_thread=%d seq=%" PRIu64
+                    " site=[%s] max_lifetime=%" PRIu64 " size=%zu ptr=" PTR_FORMAT,
+                    logical_thread, per_thread_seq, alloc_site,
+                    site_max, size, p2i(ptr));
       return true;
     }
   }
@@ -1693,10 +1866,10 @@ bool EpsilonOracle::register_allocation(int64_t runtime_thread_id, void* ptr, si
       Atomic::add(&_tracked_alloc_counter, (uint64_t)1);
       Atomic::add(&_allocated_bytes, size);
 
-      log_info(gc)("Oracle: TYPE_MAX_MATCH logical_thread=%d seq=%" PRIu64
-                   " type=[%s] max_lifetime=%" PRIu64 " size=%zu ptr=" PTR_FORMAT,
-                   logical_thread, per_thread_seq, alloc_type,
-                   type_max, size, p2i(ptr));
+      log_debug(gc)("Oracle: TYPE_MAX_MATCH logical_thread=%d seq=%" PRIu64
+                    " type=[%s] max_lifetime=%" PRIu64 " size=%zu ptr=" PTR_FORMAT,
+                    logical_thread, per_thread_seq, alloc_type,
+                    type_max, size, p2i(ptr));
       return true;
     }
 
@@ -2335,6 +2508,7 @@ void EpsilonOracle::finalize() {
   log_info(gc)("    Thread0 leak:   %" PRIu64, _matching_stats.thread0_leaked);
   log_info(gc)("    Site ctr match: %" PRIu64, _matching_stats.site_counter_matches);
   log_info(gc)("    Site FIFO match:%" PRIu64, _matching_stats.site_fifo_matches);
+  log_info(gc)("    Site inv match: %" PRIu64, _matching_stats.site_invocation_matches);
   log_info(gc)("    Site max match: %" PRIu64, _matching_stats.site_max_matches);
   log_info(gc)("    Type max match: %" PRIu64, _matching_stats.type_max_matches);
   log_info(gc)("    Unmatched leak: %" PRIu64, _matching_stats.unmatched_leaked);

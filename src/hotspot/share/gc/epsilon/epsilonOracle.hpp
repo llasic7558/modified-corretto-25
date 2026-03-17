@@ -143,6 +143,15 @@ struct SiteLifetimeInfo {
   char site_key[256];          // Composite key: "site_key:SIZE" or "type:SIZE"
 };
 
+// Per-object invocation-based lookup entry
+struct InvocationMapEntry {
+  int32_t logical_thread;
+  uint64_t invocation;
+  OracleEntry* entry;           // Points into _entries array
+  InvocationMapEntry* next;     // Hash chain
+  char site_key[128];           // Truncated site key for lookup
+};
+
 // Statistics for resilient oracle matching
 struct OracleMatchingStats {
   volatile uint64_t thread0_skipped;     // Thread 0 allocations skipped
@@ -167,6 +176,7 @@ struct OracleMatchingStats {
   volatile uint64_t site_mismatch;       // Type+size matched but allocating method didn't (leaked safely)
   volatile uint64_t min_lifetime_leaked; // Leaked due to EpsilonOracleMinLifetime guard
   volatile uint64_t stat_outlier_leaked; // Leaked due to statistical outlier detection
+  volatile uint64_t site_invocation_matches; // Matched via (thread, site_key, invocation) 1:1 [invocation map]
   volatile uint64_t site_counter_matches;// Matched via (thread, site_key, invocation) 1:1
   volatile uint64_t site_fifo_matches;   // Matched via site-keyed FIFO (invocation diverged) [LEGACY]
   volatile uint64_t site_max_matches;    // Matched via per-site max lifetime (replaces FIFO)
@@ -273,11 +283,31 @@ private:
   DeathBucket** _death_map;
 
   // Per-site max lifetime map (replaces FIFO for death scheduling)
+public:
   static const size_t SITE_LIFETIME_MAP_SIZE = 4096;
+private:
   SiteLifetimeInfo* _site_lifetime_map[SITE_LIFETIME_MAP_SIZE];
 
   // Per-type max lifetime map (fallback when site not found)
   SiteLifetimeInfo* _type_lifetime_map[SITE_LIFETIME_MAP_SIZE];
+
+  // Invocation-based per-object lookup map
+  static const size_t INVOCATION_MAP_SIZE = 1 << 20;  // 1M buckets
+  InvocationMapEntry** _invocation_map;
+
+  // Runtime per-site invocation counters (mirrors oracle_generator renumbering)
+  struct RuntimeSiteCounter {
+      int32_t logical_thread;
+      char site_key[128];
+      uint64_t count;
+      RuntimeSiteCounter* next;
+  };
+  static const size_t RUNTIME_COUNTER_MAP_SIZE = 4096;
+  RuntimeSiteCounter* _runtime_counter_map[RUNTIME_COUNTER_MAP_SIZE];
+
+  void build_invocation_map();
+  OracleEntry* lookup_invocation(int32_t logical_thread, const char* site_key, uint64_t invocation) const;
+  uint64_t next_runtime_invocation(int32_t logical_thread, const char* site_key);
 
   // Build lifetime maps from loaded entries
   void build_site_lifetime_maps();
