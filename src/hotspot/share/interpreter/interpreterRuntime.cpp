@@ -316,7 +316,7 @@ static bool oracle_should_track_allocation(JavaThread* current, ConstantPool* po
       strncmp(klass_name, "jdk/", 4) == 0 ||
       strncmp(klass_name, "sun/", 4) == 0 ||
       strncmp(klass_name, "com/sun/", 8) == 0 ||
-      strncmp(klass_name, "javassist/", 10) == 0 ||
+      strncmp(klass_name, "org/objectweb/asm/", 18) == 0 ||
       strncmp(klass_name, "org/slf4j/", 10) == 0 ||
       strncmp(klass_name, "org/apache/logging/", 19) == 0 ||
       strncmp(klass_name, "com/github/luben/zstd/", 22) == 0) {
@@ -333,48 +333,27 @@ static bool oracle_should_track_allocation(JavaThread* current, ConstantPool* po
     return false;
   }
 
-  // Skip classes that ET fails to instrument due to Javassist BadBytecode errors.
-  // These classes have allocations invisible to ET, creating phantom allocations
-  // that shift per-thread sequence counters and corrupt relative lifetime calculations.
-  // List generated from ET3 diagnostic output on DaCapo lusearch (small).
-  static const char* _et_failed_classes[] = {
-    "org/apache/lucene/backward_codecs/lucene70/Lucene70DocValuesProducer",
-    "org/apache/lucene/backward_codecs/lucene80/Lucene80DocValuesProducer",
-    "org/apache/lucene/codecs/lucene90/Lucene90DocValuesProducer",
-    "org/apache/lucene/codecs/lucene90/Lucene90CompoundFormat",
-    "org/apache/lucene/index/IndexWriter",
-    "org/apache/lucene/search/TimeLimitingBulkScorer",
-    "org/apache/lucene/analysis/CharArrayMap",
-    nullptr
-  };
-  for (const char** p = _et_failed_classes; *p != nullptr; p++) {
-    if (strcmp(klass_name, *p) == 0) {
-      Atomic::inc(&_oracle_skip_boot);
-      if (EpsilonOracleVerboseTracking) {
-        log_info(gc)("Oracle SKIP_ET_FAILED: class=%s", pool_holder->external_name());
-      }
-      return false;
-    }
-  }
-
-  // Skip <clinit> (static initializer) methods. Javassist cannot safely instrument
-  // <clinit> due to "Operand stack underflow" errors, so ET never records allocations
-  // inside static initializers. InterpreterRuntime must skip them to match.
-  // NOTE: <init> (constructors) ARE instrumented by ET and must be tracked here.
+  // Method-level filter: skip allocations in methods that ET's shouldIgnoreMethod() skips.
+  // ET (ASM) skips these methods entirely — no allocation, field, or M/E instrumentation.
+  // InterpreterRuntime must skip them too so per-thread allocation sequences stay in sync.
   {
     LastFrameAccessor lfa(current);
     Method* m = lfa.method();
-    if (strcmp(m->name()->as_C_string(), "<clinit>") == 0) {
+    const char* method_name = m->name()->as_C_string();
+    if (strcmp(method_name, "<clinit>") == 0 ||
+        strcmp(method_name, "<init>") == 0 ||
+        strcmp(method_name, "equals") == 0 ||
+        strcmp(method_name, "hashCode") == 0 ||
+        strcmp(method_name, "finalize") == 0 ||
+        strcmp(method_name, "toString") == 0 ||
+        strcmp(method_name, "wait") == 0 ||
+        strcmp(method_name, "notify") == 0 ||
+        strcmp(method_name, "notifyAll") == 0 ||
+        strncmp(method_name, "access$", 7) == 0) {
       Atomic::inc(&_oracle_skip_boot);
       return false;
     }
   }
-
-  // NOTE: Method-level filtering for <init>, equals, hashCode, etc. was REMOVED.
-  // ET records allocations inside ALL methods of instrumented classes, including
-  // <init> constructors. ET's shouldIgnoreMethod() only controls M/E events,
-  // NOT allocation tracking. So InterpreterRuntime must track all allocations
-  // in non-bootstrap classes to match the oracle (except <clinit> above).
 
   Atomic::inc(&_oracle_tracked);
 

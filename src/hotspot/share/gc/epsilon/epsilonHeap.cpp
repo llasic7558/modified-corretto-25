@@ -376,7 +376,7 @@ HeapWord* EpsilonHeap::allocate_work_oracle(size_t size, bool verbose) {
     // Track allocated bytes
     Atomic::add(&_oracle_allocated_bytes, size_in_bytes);
 
-    if (verbose) {
+    if (EpsilonOracleVerboseTracking) {
       Thread* cur = Thread::current();
       const char* tname = (cur != nullptr && cur->is_Java_thread()) ?
                           JavaThread::cast(cur)->name() : "<non-java>";

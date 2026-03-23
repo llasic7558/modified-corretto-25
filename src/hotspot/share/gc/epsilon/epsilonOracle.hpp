@@ -307,7 +307,9 @@ private:
 
   void build_invocation_map();
   OracleEntry* lookup_invocation(int32_t logical_thread, const char* site_key, uint64_t invocation) const;
-  uint64_t next_runtime_invocation(int32_t logical_thread, const char* site_key);
+  RuntimeSiteCounter* find_or_create_counter(int32_t logical_thread, const char* site_key);
+  uint64_t peek_runtime_invocation(int32_t logical_thread, const char* site_key);
+  void commit_runtime_invocation(int32_t logical_thread, const char* site_key);
 
   // Build lifetime maps from loaded entries
   void build_site_lifetime_maps();

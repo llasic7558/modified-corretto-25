@@ -930,9 +930,8 @@ OracleEntry* EpsilonOracle::lookup_invocation(int32_t logical_thread, const char
   return nullptr;
 }
 
-uint64_t EpsilonOracle::next_runtime_invocation(int32_t logical_thread, const char* site_key) {
-  if (site_key == nullptr || site_key[0] == '\0') return 0;
-
+// Find or create counter for (thread, site_key). Returns the counter pointer.
+EpsilonOracle::RuntimeSiteCounter* EpsilonOracle::find_or_create_counter(int32_t logical_thread, const char* site_key) {
   size_t bucket = (size_t)logical_thread * 31;
   for (const char* p = site_key; *p; p++) {
     bucket = bucket * 31 + (unsigned char)*p;
@@ -943,19 +942,34 @@ uint64_t EpsilonOracle::next_runtime_invocation(int32_t logical_thread, const ch
   while (counter != nullptr) {
     if (counter->logical_thread == logical_thread &&
         strcmp(counter->site_key, site_key) == 0) {
-      return ++counter->count;
+      return counter;
     }
     counter = counter->next;
   }
 
+  // Create new counter starting at 0
   counter = NEW_C_HEAP_OBJ(RuntimeSiteCounter, mtGC);
   counter->logical_thread = logical_thread;
   strncpy(counter->site_key, site_key, sizeof(counter->site_key) - 1);
   counter->site_key[sizeof(counter->site_key) - 1] = '\0';
-  counter->count = 1;
+  counter->count = 0;
   counter->next = _runtime_counter_map[bucket];
   _runtime_counter_map[bucket] = counter;
-  return 1;
+  return counter;
+}
+
+// Peek at the next invocation count WITHOUT incrementing
+uint64_t EpsilonOracle::peek_runtime_invocation(int32_t logical_thread, const char* site_key) {
+  if (site_key == nullptr || site_key[0] == '\0') return 0;
+  RuntimeSiteCounter* counter = find_or_create_counter(logical_thread, site_key);
+  return counter->count + 1;  // What the next invocation WOULD be
+}
+
+// Commit the invocation counter advance (call after confirmed match)
+void EpsilonOracle::commit_runtime_invocation(int32_t logical_thread, const char* site_key) {
+  if (site_key == nullptr || site_key[0] == '\0') return;
+  RuntimeSiteCounter* counter = find_or_create_counter(logical_thread, site_key);
+  counter->count++;
 }
 
 uint64_t EpsilonOracle::get_site_max_lifetime(int32_t logical_thread, const char* site_key, size_t size) const {
@@ -1753,25 +1767,73 @@ bool EpsilonOracle::register_allocation(int64_t runtime_thread_id, void* ptr, si
   // Type-keyed FIFO handles divergence via TYPE_EXHAUSTED (leak safely).
 
   // ============================================================
-  // LAYER 0: SITE_INVOCATION_MATCH — per-object lifetime via exact invocation
+  // LAYER 0: SITE_INVOCATION_MATCH — DISABLED
   // ============================================================
+  // Per-object invocation matching causes premature frees due to
+  // allocation order divergence between trace and replay. Even with
+  // peek/commit counters and site_max capping, the invocation counters
+  // diverge because ET can't instrument all methods (Javassist/ASM
+  // BadBytecode failures create phantom allocations). Disabled until
+  // tracing is done at the JVM level (InterpreterRuntime) instead of
+  // bytecode instrumentation.
+  //
+  // See: docs/superpowers/specs/2026-03-17-hybrid-invocation-matching-design.md
+#if 0  // DISABLED — causes SIGSEGV/NPE from premature frees
   if (alloc_site != nullptr && alloc_site[0] != '\0') {
-    uint64_t runtime_inv = next_runtime_invocation(logical_thread, alloc_site);
-    OracleEntry* matched = lookup_invocation(logical_thread, alloc_site, runtime_inv);
+    uint64_t peek_inv = peek_runtime_invocation(logical_thread, alloc_site);
+    OracleEntry* matched = lookup_invocation(logical_thread, alloc_site, peek_inv);
 
     if (matched != nullptr && matched->size == size) {
-      schedule_death_relative(*matched, ptr, size, logical_thread, per_thread_seq);
+      commit_runtime_invocation(logical_thread, alloc_site);
+
+      uint64_t entry_lifetime = (matched->free_seq > matched->alloc_seq)
+                                ? (matched->free_seq - matched->alloc_seq) : 1;
+      uint64_t site_max = get_site_max_lifetime(logical_thread, alloc_site, size);
+      uint64_t safe_max = (site_max > 0) ? (uint64_t)((double)site_max * 1.1) : entry_lifetime;
+      uint64_t capped = (entry_lifetime < safe_max) ? entry_lifetime : safe_max;
+      uint64_t target_seq = per_thread_seq + capped;
+
+      bool defer = false;
+      if (EpsilonOracleNoFreeThread0 && logical_thread == 0) {
+        Atomic::add(&_matching_stats.thread0_leaked, (uint64_t)1);
+        defer = true;
+      }
+      if (!defer && matched->type[0] != '\0') {
+        if (strstr(matched->type, "ClassLoader") != nullptr ||
+            strcmp(matched->type, "java.lang.Class") == 0 ||
+            strncmp(matched->type, "org.dacapo.", 11) == 0) {
+          Atomic::add(&_matching_stats.classloader_leaked, (uint64_t)1);
+          defer = true;
+        }
+      }
+      if (defer) target_seq = UINT64_MAX - 1;
+
+      {
+        MutexLocker ml(_oracle_lock, Mutex::_no_safepoint_check_flag);
+        size_t bucket_idx = hash_thread_seq(logical_thread, target_seq);
+        DeathBucket* db = NEW_C_HEAP_OBJ(DeathBucket, mtGC);
+        db->logical_thread = logical_thread;
+        db->seq = target_seq;
+        db->ptr = ptr;
+        db->size = size;
+        db->next = _death_map[bucket_idx];
+        _death_map[bucket_idx] = db;
+      }
+
       Atomic::add(&_matching_stats.site_invocation_matches, (uint64_t)1);
       Atomic::add(&_tracked_alloc_counter, (uint64_t)1);
       Atomic::add(&_allocated_bytes, size);
 
       log_debug(gc)("Oracle: SITE_INVOCATION_MATCH logical_thread=%d seq=%" PRIu64
-                    " site=[%s] invocation=%" PRIu64 " size=%zu ptr=" PTR_FORMAT,
+                    " site=[%s] inv=%" PRIu64 " lifetime=%" PRIu64
+                    " capped=%" PRIu64 " size=%zu ptr=" PTR_FORMAT,
                     logical_thread, per_thread_seq, alloc_site,
-                    runtime_inv, size, p2i(ptr));
+                    peek_inv, entry_lifetime, capped, size, p2i(ptr));
       return true;
     }
+    // No match — do NOT advance counter, fall through to SITE_MAX_MATCH
   }
+#endif  // DISABLED SITE_INVOCATION_MATCH
 
   // ============================================================
   // LAYER 1: SITE_MAX_MATCH — per-site max lifetime (no FIFO)
